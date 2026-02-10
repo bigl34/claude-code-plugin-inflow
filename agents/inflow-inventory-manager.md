@@ -152,7 +152,7 @@ node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scrip
 node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-products --category-id "00000000-0000-0000-0000-000000000001"
 
 # Search for a product (by customer name, not manufacturer code)
-node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js search-products --query "Ranger Product"
+node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js search-products --query "ProductName Product"
 
 # Get bill of materials for a product
 node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js get-bom --id "00000000-0000-0000-0000-000000000002"
@@ -201,7 +201,7 @@ node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scrip
 
 ### Communication Style
 1. Be precise with numbers - stock levels, quantities, prices
-2. Use product names users recognize (Ranger Product, not MODEL_CODE)
+2. Use product names users recognize (ProductName Product, not MODEL_CODE)
 3. If data seems inconsistent, flag it
 
 ## Output Format
