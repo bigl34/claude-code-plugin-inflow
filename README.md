@@ -56,40 +56,40 @@ node scripts/dist/cli.js list-products
 
 ```bash
 # List products
-node scripts/dist/cli.js list-products --limit 10
+node /Users/USER/node scripts/dist/cli.js list-products --limit 10
 
 # List all product categories
-node scripts/dist/cli.js list-categories
+node /Users/USER/node scripts/dist/cli.js list-categories
 
 # List products filtered by category name
-node scripts/dist/cli.js list-products --category "Parts" --limit 20
+node /Users/USER/node scripts/dist/cli.js list-products --category "Parts" --limit 20
 
 # List products filtered by category ID
-node scripts/dist/cli.js list-products --category-id "00000000-0000-0000-0000-000000000001"
+node /Users/USER/node scripts/dist/cli.js list-products --category-id "00000000-0000-0000-0000-000000000001"
 
 # Search for a product (by customer name, not manufacturer code)
-node scripts/dist/cli.js search-products --query "ProductName Product"
+node /Users/USER/node scripts/dist/cli.js search-products --query "ProductName Product"
 
 # Get bill of materials for a product
-node scripts/dist/cli.js get-bom --id "00000000-0000-0000-0000-000000000002"
+node /Users/USER/node scripts/dist/cli.js get-bom --id "00000000-0000-0000-0000-000000000002"
 
 # Get stock levels for a specific product
-node scripts/dist/cli.js get-stock-levels --product-id "00000000-0000-0000-0000-000000000003"
+node /Users/USER/node scripts/dist/cli.js get-stock-levels --product-id "00000000-0000-0000-0000-000000000003"
 
 # List sales orders (Open status)
-node scripts/dist/cli.js list-sales-orders --status "Open" --limit 10
+node /Users/USER/node scripts/dist/cli.js list-sales-orders --status "Open" --limit 10
 
 # List warehouse locations
-node scripts/dist/cli.js list-locations
+node /Users/USER/node scripts/dist/cli.js list-locations
 
 # List adjustment reasons
-node scripts/dist/cli.js list-adjustment-reasons
+node /Users/USER/node scripts/dist/cli.js list-adjustment-reasons
 
 # List stock transfers
-node scripts/dist/cli.js list-stock-transfers --status "Open"
+node /Users/USER/node scripts/dist/cli.js list-stock-transfers --status "Open"
 
 # List stock counts
-node scripts/dist/cli.js list-stock-counts --status "InProgress"
+node /Users/USER/node scripts/dist/cli.js list-stock-counts --status "InProgress"
 ```
 
 ## How It Works

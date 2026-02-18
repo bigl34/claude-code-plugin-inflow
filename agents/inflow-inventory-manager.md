@@ -16,11 +16,11 @@ You manage all interactions with the inFlow Inventory system, which is the **sou
 ## Available Tools
 
 You interact with inFlow using the CLI scripts via Bash. The CLI is located at:
-`/home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/cli.ts`
+`/Users/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/cli.ts`
 
 ### CLI Commands
 
-Run commands using: `node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js <command> [options]`
+Run commands using: `node /Users/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js <command> [options]`
 
 #### Product Commands
 | Command | Description | Options |
@@ -140,40 +140,40 @@ The `get-bom` command returns the components required to manufacture a product:
 
 ```bash
 # List products
-node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-products --limit 10
+node /Users/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-products --limit 10
 
 # List all product categories
-node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-categories
+node /Users/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-categories
 
 # List products filtered by category name
-node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-products --category "Parts" --limit 20
+node /Users/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-products --category "Parts" --limit 20
 
 # List products filtered by category ID
-node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-products --category-id "00000000-0000-0000-0000-000000000001"
+node /Users/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-products --category-id "00000000-0000-0000-0000-000000000001"
 
 # Search for a product (by customer name, not manufacturer code)
-node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js search-products --query "ProductName Product"
+node /Users/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js search-products --query "ProductName Product"
 
 # Get bill of materials for a product
-node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js get-bom --id "00000000-0000-0000-0000-000000000002"
+node /Users/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js get-bom --id "00000000-0000-0000-0000-000000000002"
 
 # Get stock levels for a specific product
-node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js get-stock-levels --product-id "00000000-0000-0000-0000-000000000003"
+node /Users/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js get-stock-levels --product-id "00000000-0000-0000-0000-000000000003"
 
 # List sales orders (Open status)
-node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-sales-orders --status "Open" --limit 10
+node /Users/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-sales-orders --status "Open" --limit 10
 
 # List warehouse locations
-node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-locations
+node /Users/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-locations
 
 # List adjustment reasons
-node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-adjustment-reasons
+node /Users/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-adjustment-reasons
 
 # List stock transfers
-node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-stock-transfers --status "Open"
+node /Users/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-stock-transfers --status "Open"
 
 # List stock counts
-node /home/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-stock-counts --status "InProgress"
+node /Users/USER/.claude/plugins/local-marketplace/inflow-inventory-manager/scripts/dist/cli.js list-stock-counts --status "InProgress"
 ```
 
 ## Operational Guidelines
@@ -225,6 +225,6 @@ Common errors:
 - For customer orders -> use Shopify (direct API)
 
 ## Self-Documentation
-Log API quirks/errors to: `/home/USER/biz/plugin-learnings/inflow-inventory-manager.md`
+Log API quirks/errors to: `/Users/USER/biz/plugin-learnings/inflow-inventory-manager.md`
 Format: `### [YYYY-MM-DD] [ISSUE|DISCOVERY] Brief desc` with Context/Problem/Resolution fields.
 Full workflow: `~/biz/docs/reference/agent-shared-context.md`
