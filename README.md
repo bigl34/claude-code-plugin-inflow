@@ -3,7 +3,7 @@
 
 inFlow Inventory stock management and operations
 
-![Version](https://img.shields.io/badge/version-1.7.3-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
+![Version](https://img.shields.io/badge/version-1.8.0-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
 
 ## Features
 
@@ -42,14 +42,6 @@ node scripts/dist/cli.js list-products
    ```
 4. Ensure the MCP server binary is available on your system (see the service's documentation)
 
-## Configuration
-
-Copy `config.template.json` to `config.json` and fill in the required values:
-
-| Field | Placeholder |
-|-------|-------------|
-| `credentials_path` | `/path/to/your/credentials` |
-
 ## Available Commands
 
 | Command           | Description                 | Options                            |
@@ -64,40 +56,40 @@ Copy `config.template.json` to `config.json` and fill in the required values:
 
 ```bash
 # List products
-node /Users/USER/node scripts/dist/cli.js list-products --limit 10
+node $HOME/node scripts/dist/cli.js list-products --limit 10
 
 # List all product categories
-node /Users/USER/node scripts/dist/cli.js list-categories
+node $HOME/node scripts/dist/cli.js list-categories
 
 # List products filtered by category name
-node /Users/USER/node scripts/dist/cli.js list-products --category "Parts" --limit 20
+node $HOME/node scripts/dist/cli.js list-products --category "Parts" --limit 20
 
 # List products filtered by category ID
-node /Users/USER/node scripts/dist/cli.js list-products --category-id "00000000-0000-0000-0000-000000000001"
+node $HOME/node scripts/dist/cli.js list-products --category-id "00000000-0000-0000-0000-000000000001"
 
 # Search for a product (by customer name, not manufacturer code)
-node /Users/USER/node scripts/dist/cli.js search-products --query "ProductName Product"
+node $HOME/node scripts/dist/cli.js search-products --query "ProductName Product"
 
 # Get bill of materials for a product
-node /Users/USER/node scripts/dist/cli.js get-bom --id "00000000-0000-0000-0000-000000000002"
+node $HOME/node scripts/dist/cli.js get-bom --id "00000000-0000-0000-0000-000000000002"
 
 # Get stock levels for a specific product
-node /Users/USER/node scripts/dist/cli.js get-stock-levels --product-id "00000000-0000-0000-0000-000000000003"
+node $HOME/node scripts/dist/cli.js get-stock-levels --product-id "00000000-0000-0000-0000-000000000003"
 
 # List sales orders (Open status)
-node /Users/USER/node scripts/dist/cli.js list-sales-orders --status "Open" --limit 10
+node $HOME/node scripts/dist/cli.js list-sales-orders --status "Open" --limit 10
 
 # List warehouse locations
-node /Users/USER/node scripts/dist/cli.js list-locations
+node $HOME/node scripts/dist/cli.js list-locations
 
 # List adjustment reasons
-node /Users/USER/node scripts/dist/cli.js list-adjustment-reasons
+node $HOME/node scripts/dist/cli.js list-adjustment-reasons
 
 # List stock transfers
-node /Users/USER/node scripts/dist/cli.js list-stock-transfers --status "Open"
+node $HOME/node scripts/dist/cli.js list-stock-transfers --status "Open"
 
 # List stock counts
-node /Users/USER/node scripts/dist/cli.js list-stock-counts --status "InProgress"
+node $HOME/node scripts/dist/cli.js list-stock-counts --status "InProgress"
 ```
 
 ## How It Works
