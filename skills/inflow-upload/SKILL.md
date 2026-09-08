@@ -30,7 +30,7 @@ Two browser automation modes for token extraction:
 
 Parse `$ARGUMENTS` for:
 1. **`--chrome` flag** — if present, use Chrome MCP path (Step 2B); otherwise use Playwright (Step 2A)
-2. **Order number** — PO number (e.g. `PO-000011`) or SO number
+2. **Order number** — PO number or SO number
 3. **File paths** — absolute paths to files to upload
 
 If order number or file paths were not provided, ask the user.
@@ -325,7 +325,7 @@ Note: This is PUT to the **collection URL** (not `/purchase-orders/{id}`). The P
     "type": "purchaseOrders",
     "attributes": {
       "timestamp": "<from Step 3 — DO NOT MODIFY>",
-      "orderNumber": "<e.g. PO-000011>",
+      "orderNumber": "<order number from Step 3>",
       "orderDate": "<e.g. 2025-12-01>"
     },
     "relationships": {
@@ -429,3 +429,7 @@ Report to user:
 14. **TOTP codes are time-sensitive.** Generate the TOTP code immediately before filling it in (30-second window). Do not cache or reuse codes.
 
 15. **Do not retry failed Playwright logins.** If login fails (wrong credentials, changed password, unexpected UI), stop and report to the user. Do not retry in a loop — this risks account lockout.
+
+## Documentation Hygiene
+
+Before the final response, compare the third-party UI/API/MCP behavior you observed with this skill and the relevant runbook. If the provider behaved differently than documented, update the most specific `~/biz/plugin-learnings/<service>.md` file before reporting the task complete. Use `~/biz/important/learnings.md` only for cross-cutting lessons.

@@ -112,11 +112,11 @@ Accept: application/vnd.api+json; version=2026-02-24
 ```json
 {
   "data": {
-    "id": "c657960f-9c44-4360-ad7f-1704ca8bc84d",
+    "id": "YOUR_PO_UUID",
     "type": "purchaseOrders",
     "attributes": {
       "timestamp": "00000000000DB251",
-      "orderNumber": "PO-000011",
+      "orderNumber": "YOUR_PO_NUMBER",
       "orderDate": "2025-12-01",
       "remarks": "Some notes\r\nwith line breaks"
     },
@@ -183,11 +183,11 @@ Content-Type: application/vnd.api+json
 {
   "meta": {"apiVersion": "2026-02-24"},
   "data": {
-    "id": "c657960f-9c44-4360-ad7f-1704ca8bc84d",
+    "id": "YOUR_PO_UUID",
     "type": "purchaseOrders",
     "attributes": {
       "timestamp": "00000000000DB251",
-      "orderNumber": "PO-000011",
+      "orderNumber": "YOUR_PO_NUMBER",
       "orderDate": "2025-12-01"
     },
     "relationships": {

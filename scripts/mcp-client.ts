@@ -1,31 +1,307 @@
-/**
- * inFlow Inventory MCP Client
- *
- * Wrapper client for the inFlow Cloud API via MCP server.
- * Handles products, stock levels, orders, transfers, and serial number tracking.
- * Configuration from config.json with INFLOW_API_KEY and INFLOW_COMPANY_ID env vars.
- */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { readFileSync } from "fs";
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
+import { loadServiceConfig, z } from "@local/cli-utils";
 import { PluginCache, TTL, createCacheKey } from "@local/plugin-cache";
+import { DirtyTagQuarantine } from "./mutation-cache.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const InFlowConfigSchema = z.object({
+  mcpServer: z.object({
+    command: z.string().min(1),
+    args: z.array(z.string()),
+    env: z.record(z.string(), z.string()).optional(),
+  }),
+});
 
-interface MCPConfig {
-  mcpServer: {
-    command: string;
-    args: string[];
-    env?: Record<string, string>;
-  };
+type MCPConfig = z.infer<typeof InFlowConfigSchema>;
+
+const LEGACY_WRITE_REPLACEMENTS: Record<string, string> = {
+  upsert_product: "set_product",
+  upsert_sales_order: "set_sales_order",
+  upsert_purchase_order: "set_purchase_order",
+  receive_purchase_order: "set_purchase_order_receipts",
+  unreceive_purchase_order: "set_purchase_order_receipts",
+  upsert_customer: "set_customer",
+  upsert_vendor: "set_vendor",
+  upsert_stock_adjustment: "set_stock_adjustment",
+  upsert_stock_transfer: "set_stock_transfer",
+  upsert_stock_count: "set_stock_count",
+  upsert_manufacturing_order: "set_manufacturing_order",
+  upsert_taxing_scheme: "set_taxing_scheme",
+  upsert_webhook: "set_webhook",
+  delete_webhook: "remove_webhook",
+};
+
+export interface ManufacturingComponentInput {
+  itemBomId?: string;
+  childProductId: string;
+  quantity: string | number;
+  uomQuantity?: string | number;
+  uom?: string | null;
 }
 
-// Initialize cache with namespace
-// Stock levels use short TTL (5 min), products use longer (15 min)
+export interface ManufacturingOperationInput {
+  productOperationId?: string;
+  operationTypeId: string;
+  lineNum?: number;
+  cost?: string | number | null;
+  estimatedPerHourCost?: string | number | null;
+  estimatedSeconds?: string | number | null;
+  instructions?: string;
+  trackTime?: boolean;
+}
+
+export interface ExplicitMutationConfirmationScope {
+  schemaVersion: "explicit-confirmation-scope/v1";
+  tenantFingerprint: string;
+  baseHost: string;
+  apiVersion: string;
+  serverBuildIdentity: string;
+  operation: string;
+  resourceType: string;
+  resourceId: string | null;
+  mode: string;
+  adapterVersion: string;
+  serializerVersion: string;
+  contractVersion: string;
+  currentSemanticHash: string | null;
+  currentWriteShapeHash: string | null;
+  entityTimestamp: string | null;
+  sourceHashes: Array<{ name: string; hash: string }>;
+  desiredHash: string;
+}
+
+export interface ExplicitMutationConfirmation {
+  scope: ExplicitMutationConfirmationScope;
+  confirmationHash: string;
+}
+
+export interface ManufacturingConfigRequest {
+  productId: string;
+  mode?: "patch" | "replace";
+  components?: ManufacturingComponentInput[];
+  removeItemBomIds?: string[];
+  productOperations?: ManufacturingOperationInput[];
+  removeProductOperationIds?: string[];
+  autoAssemble?: boolean;
+  includeQuantityBuildable?: boolean;
+  allowInactiveComponents?: boolean;
+  expectedConfigHash?: string;
+  expectedProductTimestamp?: string;
+  dryRun?: boolean;
+  previewToken?: string;
+  idempotencyKey?: string;
+  expectedSemanticHash?: string;
+  expectedWriteShapeHash?: string;
+  expectedEntityTimestamp?: string;
+  expectedDesiredHash?: string;
+  confirmation?: ExplicitMutationConfirmation;
+  operationId?: string;
+}
+
+export interface MutationResult {
+  operationId: string;
+  idempotencyKey?: string;
+  previewToken?: string;
+  applicationState: string;
+  cacheInvalidationRequired?: boolean;
+  applied?: boolean | "unknown";
+  appliedMayBeTrue?: boolean;
+  verified?: boolean;
+  currentSemanticHash?: string;
+  currentWriteShapeHash?: string;
+  entityTimestamp?: string;
+  desiredHash?: string;
+  confirmationScope?: ExplicitMutationConfirmationScope;
+  confirmationHash?: string;
+  confirmationValidated?: boolean;
+  invalidationTags?: string[];
+  [key: string]: unknown;
+}
+
+interface ManufacturingConfigMutationEnvelope {
+  cacheInvalidationRequired?: boolean;
+  appliedMayBeTrue?: boolean;
+  applied?: boolean | "unknown";
+  applicationState?: string;
+  operationId?: string;
+  actual?: { productVariant?: { productGroupId?: unknown } };
+  before?: { productVariant?: { productGroupId?: unknown } };
+  [key: string]: unknown;
+}
+
+function compactDefined(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(compactDefined);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, child]) => child !== undefined)
+        .map(([key, child]) => [key, compactDefined(child)]),
+    );
+  }
+  return value;
+}
+
+export interface MinimalMcpClient {
+  callTool(params: { name: string; arguments: Record<string, unknown> }): Promise<{
+    content: unknown;
+    isError?: boolean;
+  }>;
+  listTools(): Promise<{ tools: unknown[] }>;
+  close(): Promise<void>;
+}
+
+export interface RecentProductsResult {
+  data: Array<Record<string, unknown>>;
+  activeProductNames: Array<{ productId: string; name: string; isActive: true }>;
+  since: string;
+  before: string;
+  activeOnly: boolean;
+  complete: true;
+  cacheBypassed: true;
+  providerPageSize: number;
+  requiredConsecutiveStableScans: number;
+  scanAttempts: number;
+  pageCounts: number[];
+  recordsFetchedPerScan: number[];
+  uniqueProductsPerScan: number[];
+  duplicateRecordsPerScan: number[];
+  finalUniqueProductsScanned: number;
+  inactiveProductsExcluded: number;
+  outOfWindowProductsExcluded: number;
+  invalidIsActiveCount: 0;
+  invalidCreatedDateCount: 0;
+  nameCatalogueComplete: true;
+  invalidNameCount: 0;
+}
+
+export interface ProductNameCatalogueResult {
+  data: Array<{ productId: string; name: string; isActive: boolean }>;
+  activeOnly: boolean;
+  complete: true;
+  cacheBypassed: true;
+  providerPageSize: number;
+  requiredConsecutiveStableScans: number;
+  scanAttempts: number;
+  pageCounts: number[];
+  recordsFetchedPerScan: number[];
+  uniqueProductsPerScan: number[];
+  duplicateRecordsPerScan: number[];
+  finalUniqueProductsScanned: number;
+  inactiveProductsExcluded: number;
+  invalidIsActiveCount: 0;
+  invalidNameCount: 0;
+}
+
+export interface ProductListPagination {
+  returnedCount: number;
+  totalCount: number | null;
+  totalCountKnown: boolean;
+  complete: boolean;
+  hasMore: boolean | null;
+  nextSkip: number | null;
+  startSkip: number;
+  requestedLimit: number | null;
+  paginationMode: "offset";
+}
+
+export interface ProductListResult {
+  data: any[];
+  totalCount?: number;
+  pagination: ProductListPagination;
+  [key: string]: unknown;
+}
+
+export type BulkBomReadItem =
+  | { productId: string; status: "ok"; bom: unknown }
+  | { productId: string; status: "error"; error: string };
+
+export interface BulkBomReadResult {
+  status: "complete" | "partial" | "failed";
+  complete: boolean;
+  requestedProductCount: number;
+  succeededProductCount: number;
+  failedProductCount: number;
+  concurrency: number;
+  requestIntervalMs: number;
+  maxAttemptsPerProduct: number;
+  results: BulkBomReadItem[];
+}
+
+interface CompleteProductScan {
+  products: Array<Record<string, unknown>>;
+  pageCount: number;
+  recordsFetched: number;
+  duplicateRecords: number;
+  fingerprint: string;
+}
+
+const PRODUCT_PROVIDER_PAGE_SIZE = 100;
+const RECENT_PRODUCT_STABLE_SCANS_REQUIRED = 2;
+const RECENT_PRODUCT_MAX_SCAN_ATTEMPTS = 3;
+const RECENT_PRODUCT_MAX_PAGES_PER_SCAN = 10_000;
+const BULK_BOM_REQUEST_INTERVAL_MS = 5_000;
+const BULK_BOM_MAX_ATTEMPTS_PER_PRODUCT = 3;
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJson).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, child]) => child !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right));
+    return `{${entries.map(([key, child]) => `${JSON.stringify(key)}:${stableJson(child)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function isEmptyBomRead(value: unknown): boolean {
+  if (value === null || value === undefined) return true;
+  if (typeof value === "string") return value.trim() === "";
+  if (!Array.isArray(value)) return false;
+  if (value.length === 0) return true;
+
+  return value.every((item) => {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) {
+      return false;
+    }
+    const content = item as { type?: unknown; text?: unknown };
+    return content.type === "text" &&
+      typeof content.text === "string" &&
+      content.text.trim() === "";
+  });
+}
+
+function parseIsoInstant(value: string, fieldName: string): number {
+  const parts =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.exec(value);
+  const parsed = Date.parse(value);
+  if (!parts || !Number.isFinite(parsed)) {
+    throw new Error(`${fieldName} must be a valid ISO 8601 date-time with an explicit UTC offset`);
+  }
+  const [, rawYear, rawMonth, rawDay, rawHour, rawMinute, rawSecond] = parts;
+  const year = Number(rawYear);
+  const month = Number(rawMonth);
+  const day = Number(rawDay);
+  const hour = Number(rawHour);
+  const minute = Number(rawMinute);
+  const second = Number(rawSecond);
+  const daysInMonth = month >= 1 && month <= 12
+    ? new Date(Date.UTC(year, month, 0)).getUTCDate()
+    : 0;
+  if (
+    day < 1 ||
+    day > daysInMonth ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  ) {
+    throw new Error(`${fieldName} must be a valid ISO 8601 date-time with an explicit UTC offset`);
+  }
+  return parsed;
+}
+
 const cache = new PluginCache({
   namespace: "inflow-inventory-manager",
   defaultTTL: TTL.FIVE_MINUTES,
@@ -36,75 +312,203 @@ export class InFlowMCPClient {
   private transport: StdioClientTransport | null = null;
   private config: MCPConfig;
   private connected: boolean = false;
-  private cacheDisabled: boolean = false;
+  private connectionPromise: Promise<void> | null = null;
+  private explicitlyCacheDisabled: boolean = false;
+  private injectedClient: MinimalMcpClient | null;
+  private readonly quarantine: DirtyTagQuarantine;
+  private readonly now: () => number;
+  private readonly sleep: (milliseconds: number) => Promise<void>;
 
-  constructor() {
-    // When compiled, __dirname is dist/, so look in parent for config.json
-    const configPath = join(__dirname, "..", "config.json");
-    this.config = JSON.parse(readFileSync(configPath, "utf-8"));
+  private get cacheDisabled(): boolean {
+    return this.explicitlyCacheDisabled || this.quarantine.hasDirtyState();
   }
 
-  // ============================================
-  // CACHE CONTROL
-  // ============================================
+  private set cacheDisabled(value: boolean) {
+    this.explicitlyCacheDisabled = value;
+  }
 
-  /**
-   * Disables caching for all subsequent requests.
-   */
+  constructor(opts?: {
+    client?: MinimalMcpClient;
+    config?: MCPConfig;
+    quarantinePath?: string;
+    now?: () => number;
+    sleep?: (milliseconds: number) => Promise<void>;
+  }) {
+    this.injectedClient = opts?.client ?? null;
+    this.quarantine = new DirtyTagQuarantine(opts?.quarantinePath);
+    this.now = opts?.now ?? Date.now;
+    this.sleep = opts?.sleep ?? ((milliseconds) => new Promise((resolve) => {
+      setTimeout(resolve, milliseconds);
+    }));
+
+    if (opts?.config) {
+      this.config = opts.config;
+    } else if (opts?.client) {
+      this.config = { mcpServer: { command: "", args: [] } };
+    } else {
+      this.config = loadServiceConfig("inflow-inventory-manager", {
+        schema: InFlowConfigSchema,
+      });
+    }
+  }
+
+
   disableCache(): void {
     this.cacheDisabled = true;
     cache.disable();
   }
 
-  /**
-   * Re-enables caching after it was disabled.
-   */
   enableCache(): void {
     this.cacheDisabled = false;
     cache.enable();
   }
 
-  /**
-   * Returns cache statistics including hit/miss counts.
-   */
   getCacheStats() {
     return cache.getStats();
   }
 
-  /**
-   * Clears all cached data.
-   * @returns Number of cache entries cleared
-   */
   clearCache(): number {
     return cache.clear();
   }
 
-  /**
-   * Invalidates a specific cache entry by key.
-   * @param key - The cache key to invalidate
-   * @returns true if entry was found and removed
-   */
   invalidateCacheKey(key: string): boolean {
     return cache.invalidate(key);
   }
 
-  // ============================================
-  // CONNECTION MANAGEMENT
-  // ============================================
+  private cacheBypass(tags: string[]): boolean {
+    return this.cacheDisabled || this.quarantine.hasAny(tags);
+  }
 
-  /**
-   * Establishes connection to the MCP server.
-   * Called automatically by other methods when needed.
-   */
+  private invalidateTags(tags: string[]): void {
+    for (const tag of tags) cache.invalidate(tag);
+    if (tags.some((tag) => tag.startsWith("product:") || tag.startsWith("prices:"))) {
+      cache.invalidatePattern(/^products(?:\?|_|$)/);
+      cache.invalidatePattern(/^product(?:\?|:|_|$)/);
+    }
+    if (tags.some((tag) => tag.startsWith("bom:") || tag.startsWith("product:"))) {
+      cache.invalidatePattern(/^bom(?::|-compare:)/);
+      cache.invalidatePattern(/^product_bom/);
+    }
+    if (tags.some((tag) => tag.startsWith("product-group:") || tag.startsWith("group-qty:"))) {
+      cache.invalidatePattern(/^product-group/);
+      cache.invalidatePattern(/^group-qty:/);
+      cache.invalidatePattern(/^group-audit:/);
+    }
+    if (tags.some((tag) => tag.startsWith("inventory") || tag.startsWith("mo:"))) {
+      cache.invalidatePattern(/^stock/);
+      cache.invalidatePattern(/^mo-trace:/);
+      cache.invalidatePattern(/^bom-requirements:/);
+    }
+    if (tags.some((tag) => tag.startsWith("vendor:"))) {
+      cache.invalidatePattern(/^vendors(?:\?|_|$)/);
+    }
+    if (tags.some((tag) => tag.startsWith("purchase-order:"))) {
+      cache.invalidatePattern(/^purchase_orders(?:\?|_|$)/);
+      cache.invalidatePattern(/^purchase_order(?:\?|:|_|$)/);
+    }
+  }
+
+  private handleMutationResult(result: MutationResult, fallbackTags: string[]): MutationResult {
+    const tags = result.invalidationTags?.length ? result.invalidationTags : fallbackTags;
+    const invalidate = result.cacheInvalidationRequired ?? result.appliedMayBeTrue ?? result.applied === true;
+    if (invalidate) this.invalidateTags(tags);
+    if (["applied_unverified", "unknown_after_write", "partial_applied"].includes(result.applicationState)) {
+      this.quarantine.record(result.operationId, tags, result.applicationState);
+    } else if (["applied_verified", "no_op"].includes(result.applicationState)) {
+      this.quarantine.clear(result.operationId);
+    }
+    return result;
+  }
+
+  private isCertainlyPreDispatchError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /(?:^|\b)(?:MUTATION_CONFLICT|MUTATION_PRECONDITION_REQUIRED|PREVIEW_TOKEN_SCOPE_MISMATCH|PREVIEW_TOKEN_REQUIRED|INVALID_PREVIEW_TOKEN|EXPIRED_PREVIEW_TOKEN|IDEMPOTENCY_KEY_CONFLICT|USER_CONFIRMATION_(?:REQUIRED|SCOPE_MISMATCH)|UNSUPPORTED_API_VERSION|UNSUPPORTED_WRITE_SEMANTICS|OPERATION_UNSUPPORTED|ATTESTATION_(?:MISSING|INVALID|EXPIRED|READ_FAILED)|BUILD_IDENTITY_MISSING|ENVIRONMENT_GATE_DISABLED|UNSAFE_ATTESTATION_(?:FILE|DIRECTORY)|[A-Z0-9_]*WRITES_DISABLED)(?::|\b)/.test(message);
+  }
+
+  private handleApplyException(error: unknown, operationId: string | undefined, tags: string[]): never {
+    if (!this.isCertainlyPreDispatchError(error)) {
+      this.invalidateTags(tags);
+      this.quarantine.record(operationId || `lost-${Date.now()}`, tags, "unknown_after_write");
+    }
+    throw error;
+  }
+
+  async previewThenApply(
+    tool: string,
+    request: Record<string, unknown>,
+    apply: boolean,
+    conservativeTags: string[],
+  ): Promise<MutationResult> {
+    const preview = await this.callTool(tool, { ...request, dryRun: true }) as MutationResult;
+    if (!apply) return preview;
+    return this.applyFromPreview(tool, request, preview, conservativeTags);
+  }
+
+  private async applyFromPreview(
+    tool: string,
+    request: Record<string, unknown>,
+    preview: MutationResult,
+    conservativeTags: string[],
+  ): Promise<MutationResult> {
+    const serverConfirmation =
+      preview.confirmationScope &&
+      typeof preview.confirmationHash === "string" &&
+      /^[a-f0-9]{64}$/.test(preview.confirmationHash)
+        ? {
+            confirmation: {
+              scope: preview.confirmationScope,
+              confirmationHash: preview.confirmationHash,
+            },
+          }
+        : {};
+    const applyRequest = {
+      ...request,
+      dryRun: false,
+      previewToken: preview.previewToken,
+      idempotencyKey: preview.idempotencyKey,
+      expectedSemanticHash: preview.currentSemanticHash,
+      expectedWriteShapeHash: preview.currentWriteShapeHash,
+      expectedEntityTimestamp: preview.entityTimestamp,
+      expectedDesiredHash: preview.desiredHash,
+      ...serverConfirmation,
+    };
+    try {
+      return this.handleMutationResult(await this.callTool(tool, applyRequest) as MutationResult, conservativeTags);
+    } catch (error) {
+      return this.handleApplyException(error, preview.operationId, conservativeTags);
+    }
+  }
+
+
   async connect(): Promise<void> {
     if (this.connected) return;
+
+    if (this.connectionPromise) {
+      return this.connectionPromise;
+    }
+
+    this.connectionPromise = this.establishConnection();
+    try {
+      await this.connectionPromise;
+    } finally {
+      this.connectionPromise = null;
+    }
+  }
+
+  private async establishConnection(): Promise<void> {
+    if (this.connected) return;
+
+    if (this.injectedClient) {
+      this.client = this.injectedClient as unknown as Client;
+      this.connected = true;
+      return;
+    }
 
     const env = {
       ...process.env,
       ...this.config.mcpServer.env,
     };
 
-    // Ensure required env vars are set
     if (!env.INFLOW_API_KEY) {
       throw new Error(
         "INFLOW_API_KEY environment variable is not set. " +
@@ -125,17 +529,20 @@ export class InFlowMCPClient {
     });
 
     this.client = new Client(
-      { name: "inflow-cli", version: "1.0.0" },
+      { name: "inflow-cli", version: "1.14.1" },
       { capabilities: {} }
     );
 
-    await this.client.connect(this.transport);
-    this.connected = true;
+    try {
+      await this.client.connect(this.transport);
+      this.connected = true;
+    } catch (error) {
+      this.client = null;
+      this.transport = null;
+      throw error;
+    }
   }
 
-  /**
-   * Disconnects from the MCP server.
-   */
   async disconnect(): Promise<void> {
     if (this.client && this.connected) {
       await this.client.close();
@@ -143,23 +550,141 @@ export class InFlowMCPClient {
     }
   }
 
-  /**
-   * Lists available MCP tools.
-   * @returns Array of tool definitions
-   */
   async listTools(): Promise<any[]> {
     await this.connect();
     const result = await this.client!.listTools();
     return result.tools;
   }
 
-  /**
-   * Calls an MCP tool with arguments.
-   * @param name - Tool name
-   * @param args - Tool arguments
-   * @returns Parsed tool response
-   * @throws {Error} If tool call fails
-   */
+  private async callListToolPaged(
+    name: string,
+    baseArgs: Record<string, unknown>,
+    requestedLimit: number | undefined,
+    startSkip: number
+  ): Promise<unknown> {
+    const PROVIDER_MAX_PAGE_SIZE = 100;
+
+    const needsPaging = requestedLimit !== undefined && requestedLimit > PROVIDER_MAX_PAGE_SIZE;
+    if (!needsPaging) {
+      const singlePageArgs = { ...baseArgs };
+      if (requestedLimit !== undefined) singlePageArgs.count = requestedLimit;
+      if (startSkip > 0) singlePageArgs.skip = startSkip;
+      return this.callTool(name, singlePageArgs);
+    }
+
+    let firstPageEnvelope: unknown = null;
+    const collected: unknown[] = [];
+    let skip = startSkip;
+    const seenPageFingerprints = new Set<string>();
+    const seenPageStartFingerprints = new Set<string>();
+
+    while (collected.length < requestedLimit) {
+      const remaining = requestedLimit - collected.length;
+      const pageSize = Math.min(remaining, PROVIDER_MAX_PAGE_SIZE);
+
+      let page: unknown;
+      try {
+        page = await this.callTool(name, { ...baseArgs, count: pageSize, skip });
+      } catch (error) {
+        if (collected.length === 0) throw error;
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `${name}: paging failed after ${collected.length} of ${requestedLimit} requested records ` +
+            `(page starting at skip=${skip}): ${reason}`
+        );
+      }
+
+      if (firstPageEnvelope === null) firstPageEnvelope = page;
+
+      const pageItems = this.itemsFromListResponse(page);
+      if (pageItems.length === 0) break;
+
+      const pageFingerprint = stableJson(pageItems);
+      const pageStartFingerprint = stableJson(pageItems[0]);
+      if (
+        seenPageFingerprints.has(pageFingerprint) ||
+        seenPageStartFingerprints.has(pageStartFingerprint)
+      ) {
+        throw new Error(
+          `${name}: provider returned an identical page at skip=${skip}, so paging cannot advance. ` +
+            `Collected ${collected.length} records before stopping.`
+        );
+      }
+      seenPageFingerprints.add(pageFingerprint);
+      seenPageStartFingerprints.add(pageStartFingerprint);
+
+      collected.push(...pageItems);
+
+      if (pageItems.length < pageSize) break;
+      skip += pageItems.length;
+    }
+
+    const trimmed = collected.slice(0, requestedLimit);
+    return this.withListItems(firstPageEnvelope, trimmed);
+  }
+
+  private itemsFromListResponse(response: unknown): unknown[] {
+    const maybeEnvelope = response as { data?: unknown } | null | undefined;
+    const payload = maybeEnvelope?.data ?? response ?? [];
+    return Array.isArray(payload) ? payload : [payload];
+  }
+
+  private withListItems(templateResponse: unknown, items: unknown[]): unknown {
+    const isEnvelope =
+      templateResponse !== null &&
+      typeof templateResponse === "object" &&
+      !Array.isArray(templateResponse) &&
+      "data" in templateResponse;
+
+    if (!isEnvelope) return items;
+    return { ...(templateResponse as Record<string, unknown>), data: items };
+  }
+
+  private withProductListPagination(
+    response: unknown,
+    requestedLimit: number | undefined,
+    startSkip: number
+  ): ProductListResult {
+    const data = this.itemsFromListResponse(response);
+    const envelope =
+      response !== null && typeof response === "object" && !Array.isArray(response)
+        ? (response as Record<string, unknown>)
+        : {};
+    const rawTotalCount = envelope.totalCount;
+    const { totalCount: _unvalidatedTotalCount, ...safeEnvelope } = envelope;
+    const numericTotalCount =
+      typeof rawTotalCount === "number" &&
+      Number.isSafeInteger(rawTotalCount) &&
+      rawTotalCount >= 0
+        ? rawTotalCount
+        : null;
+    const endSkip = startSkip + data.length;
+    const totalCount =
+      numericTotalCount !== null &&
+      (data.length === 0 || numericTotalCount >= endSkip)
+        ? numericTotalCount
+        : null;
+    const totalCountKnown = totalCount !== null;
+    const hasMore = totalCountKnown ? endSkip < totalCount : null;
+
+    return {
+      ...safeEnvelope,
+      data,
+      ...(totalCountKnown ? { totalCount } : {}),
+      pagination: {
+        returnedCount: data.length,
+        totalCount,
+        totalCountKnown,
+        complete: totalCountKnown && startSkip === 0 && data.length >= totalCount,
+        hasMore,
+        nextSkip: hasMore === false || data.length === 0 ? null : endSkip,
+        startSkip,
+        requestedLimit: requestedLimit ?? null,
+        paginationMode: "offset",
+      },
+    };
+  }
+
   async callTool(name: string, args: Record<string, any> = {}): Promise<any> {
     await this.connect();
 
@@ -183,69 +708,394 @@ export class InFlowMCPClient {
     return content;
   }
 
-  // ============================================
-  // PRODUCT OPERATIONS
-  // ============================================
+  async callLegacyWriteTool(
+    name: string,
+    args: Record<string, unknown>
+  ): Promise<unknown> {
+    console.error(JSON.stringify({
+      level: "warn",
+      severity: "high",
+      event: "inflow_legacy_write_tool",
+      tool: name,
+      safeWriteBypass: true,
+      masterGateApplies: false,
+      migrationRequired: true,
+      replacement: LEGACY_WRITE_REPLACEMENTS[name] ?? "no_safe_replacement_registered",
+      message: "LEGACY WRITE BYPASS: this immediate write is not controlled by INFLOW_ENABLE_SAFE_WRITES; migrate to the preview-first replacement before the 2.0 removal window.",
+    }));
+    return this.callTool(name, args);
+  }
 
-  /**
-   * Lists products with optional filtering and pagination.
-   *
-   * @param options - Filter and pagination options
-   * @param options.limit - Maximum products to return
-   * @param options.skip - Number of products to skip (pagination)
-   * @param options.filter - Smart search query (searches name, SKU, etc.)
-   * @param options.categoryId - Filter by category ID
-   * @param options.categoryName - Filter by category name
-   * @returns Paginated product list
-   *
-   * @cached TTL: 15 minutes
-   *
-   * @example
-   * const products = await client.listProducts({ filter: "Product A", limit: 20 });
-   */
+
   async listProducts(options?: {
     limit?: number;
     skip?: number;
     filter?: string;
     categoryId?: string;
     categoryName?: string;
-  }): Promise<any> {
+    include?: string[];
+    includeCount?: boolean;
+  }): Promise<ProductListResult> {
     const cacheKey = createCacheKey("products", {
       limit: options?.limit,
       skip: options?.skip,
       filter: options?.filter,
       categoryId: options?.categoryId,
       categoryName: options?.categoryName,
+      include: options?.include?.length
+        ? [...options.include].sort().join(",")
+        : undefined,
+      includeCount: options?.includeCount,
     });
 
     return cache.getOrFetch(
       cacheKey,
       async () => {
         const args: Record<string, any> = {};
-        if (options?.limit) args.count = options.limit;
-        if (options?.skip) args.skip = options.skip;
         if (options?.filter) args.smart = options.filter;
         if (options?.categoryId) args.categoryId = options.categoryId;
         if (options?.categoryName) args.categoryName = options.categoryName;
-        return this.callTool("list_products", args);
+        if (options?.include?.length) args.include = options.include;
+        if (options?.includeCount !== undefined) args.includeCount = options.includeCount;
+        const startSkip = options?.skip ?? 0;
+        const response = await this.callListToolPaged(
+          "list_products",
+          args,
+          options?.limit,
+          startSkip
+        );
+        return this.withProductListPagination(response, options?.limit, startSkip);
       },
       { ttl: TTL.FIFTEEN_MINUTES, bypassCache: this.cacheDisabled }
     );
   }
 
-  /**
-   * Retrieves a single product by ID.
-   *
-   * @param productId - inFlow product ID
-   * @param options - Additional options
-   * @param options.include - Related data to include (e.g., ["itemBoms", "locations"])
-   * @returns Product object with requested includes
-   *
-   * @cached TTL: 15 minutes
-   *
-   * @example
-   * const product = await client.getProduct("prod_123", { include: ["itemBoms"] });
-   */
+  async listRecentProducts(options: {
+    since: string;
+    before: string;
+    activeOnly?: boolean;
+  }): Promise<RecentProductsResult> {
+    const sinceMs = parseIsoInstant(options.since, "since");
+    const beforeMs = parseIsoInstant(options.before, "before");
+    if (sinceMs >= beforeMs) {
+      throw new Error("since must be earlier than before");
+    }
+
+    const activeOnly = options.activeOnly ?? true;
+    const { stableScan, scans } = await this.stableCompleteProductScans();
+
+    const invalidActiveStates = stableScan.products.filter(
+      (product) => typeof product.isActive !== "boolean"
+    );
+    if (invalidActiveStates.length > 0) {
+      const productIds = invalidActiveStates
+        .slice(0, 5)
+        .map((product) => String(product.productId));
+      throw new Error(
+        `list_products: exhaustive active-product filtering is incomplete because ` +
+          `${invalidActiveStates.length} product(s) have a missing or invalid isActive flag ` +
+          `(product IDs: ${productIds.join(", ")})`
+      );
+    }
+    const eligibleProducts = activeOnly
+      ? stableScan.products.filter((product) => product.isActive === true)
+      : stableScan.products;
+    const activeProducts = stableScan.products.filter((product) => product.isActive === true);
+    const invalidNames = activeProducts.filter(
+      (product) =>
+        typeof product.name !== "string" ||
+        product.name.trim() === "" ||
+        product.name.includes("\0") ||
+        product.name.length > 1000
+    );
+    if (invalidNames.length > 0) {
+      const productIds = invalidNames.slice(0, 5).map((product) => String(product.productId));
+      throw new Error(
+        `list_products: exhaustive active-name catalogue is incomplete because ` +
+          `${invalidNames.length} active product(s) have a missing or invalid name ` +
+          `(product IDs: ${productIds.join(", ")})`
+      );
+    }
+    const activeProductNames = activeProducts
+      .map((product) => ({
+        productId: product.productId as string,
+        name: product.name as string,
+        isActive: true as const,
+      }))
+      .sort((left, right) => left.productId.localeCompare(right.productId));
+    const productsWithCreatedDates: Array<{
+      product: Record<string, unknown>;
+      createdMs: number;
+    }> = [];
+    const invalidCreatedDates: Array<Record<string, unknown>> = [];
+    for (const product of eligibleProducts) {
+      if (typeof product.createdDttm !== "string") {
+        invalidCreatedDates.push(product);
+        continue;
+      }
+      try {
+        productsWithCreatedDates.push({
+          product,
+          createdMs: parseIsoInstant(product.createdDttm, "createdDttm"),
+        });
+      } catch {
+        invalidCreatedDates.push(product);
+      }
+    }
+    if (invalidCreatedDates.length > 0) {
+      const productIds = invalidCreatedDates
+        .slice(0, 5)
+        .map((product) => String(product.productId));
+      throw new Error(
+        `list_products: exhaustive recent-product filtering is incomplete because ` +
+          `${invalidCreatedDates.length} eligible product(s) have a missing or invalid createdDttm ` +
+          `(product IDs: ${productIds.join(", ")})`
+      );
+    }
+
+    const matchingProducts = productsWithCreatedDates
+      .filter(({ createdMs }) => createdMs >= sinceMs && createdMs < beforeMs)
+      .sort((left, right) => {
+        const createdDifference = left.createdMs - right.createdMs;
+        if (createdDifference !== 0) return createdDifference;
+        return String(left.product.productId).localeCompare(String(right.product.productId));
+      })
+      .map(({ product, createdMs }) => ({
+        ...product,
+        createdDate: new Date(createdMs).toISOString(),
+        modifiedDate: product.lastModifiedDateTime,
+      }));
+
+    return {
+      data: matchingProducts,
+      activeProductNames,
+      since: new Date(sinceMs).toISOString(),
+      before: new Date(beforeMs).toISOString(),
+      activeOnly,
+      complete: true,
+      cacheBypassed: true,
+      providerPageSize: PRODUCT_PROVIDER_PAGE_SIZE,
+      requiredConsecutiveStableScans: RECENT_PRODUCT_STABLE_SCANS_REQUIRED,
+      scanAttempts: scans.length,
+      pageCounts: scans.map((scan) => scan.pageCount),
+      recordsFetchedPerScan: scans.map((scan) => scan.recordsFetched),
+      uniqueProductsPerScan: scans.map((scan) => scan.products.length),
+      duplicateRecordsPerScan: scans.map((scan) => scan.duplicateRecords),
+      finalUniqueProductsScanned: stableScan.products.length,
+      inactiveProductsExcluded: activeOnly
+        ? stableScan.products.length - eligibleProducts.length
+        : 0,
+      outOfWindowProductsExcluded: eligibleProducts.length - matchingProducts.length,
+      invalidIsActiveCount: 0,
+      invalidCreatedDateCount: 0,
+      nameCatalogueComplete: true,
+      invalidNameCount: 0,
+    };
+  }
+
+  async listProductNames(options?: {
+    activeOnly?: boolean;
+  }): Promise<ProductNameCatalogueResult> {
+    const activeOnly = options?.activeOnly ?? true;
+    const { stableScan, scans } = await this.stableCompleteProductScans();
+
+    const invalidActiveStates = stableScan.products.filter(
+      (product) => typeof product.isActive !== "boolean"
+    );
+    if (invalidActiveStates.length > 0) {
+      const productIds = invalidActiveStates
+        .slice(0, 5)
+        .map((product) => String(product.productId));
+      throw new Error(
+        `list_products: exhaustive product-name catalogue is incomplete because ` +
+          `${invalidActiveStates.length} product(s) have a missing or invalid isActive flag ` +
+          `(product IDs: ${productIds.join(", ")})`
+      );
+    }
+
+    const eligibleProducts = activeOnly
+      ? stableScan.products.filter((product) => product.isActive === true)
+      : stableScan.products;
+    const invalidNames = eligibleProducts.filter(
+      (product) =>
+        typeof product.name !== "string" ||
+        product.name.trim() === "" ||
+        product.name.includes("\0") ||
+        product.name.length > 1000
+    );
+    if (invalidNames.length > 0) {
+      const productIds = invalidNames
+        .slice(0, 5)
+        .map((product) => String(product.productId));
+      throw new Error(
+        `list_products: exhaustive product-name catalogue is incomplete because ` +
+          `${invalidNames.length} eligible product(s) have a missing or invalid name ` +
+          `(product IDs: ${productIds.join(", ")})`
+      );
+    }
+
+    const data = eligibleProducts
+      .map((product) => ({
+        productId: product.productId as string,
+        name: product.name as string,
+        isActive: product.isActive as boolean,
+      }))
+      .sort((left, right) => left.productId.localeCompare(right.productId));
+
+    return {
+      data,
+      activeOnly,
+      complete: true,
+      cacheBypassed: true,
+      providerPageSize: PRODUCT_PROVIDER_PAGE_SIZE,
+      requiredConsecutiveStableScans: RECENT_PRODUCT_STABLE_SCANS_REQUIRED,
+      scanAttempts: scans.length,
+      pageCounts: scans.map((scan) => scan.pageCount),
+      recordsFetchedPerScan: scans.map((scan) => scan.recordsFetched),
+      uniqueProductsPerScan: scans.map((scan) => scan.products.length),
+      duplicateRecordsPerScan: scans.map((scan) => scan.duplicateRecords),
+      finalUniqueProductsScanned: stableScan.products.length,
+      inactiveProductsExcluded: activeOnly
+        ? stableScan.products.length - eligibleProducts.length
+        : 0,
+      invalidIsActiveCount: 0,
+      invalidNameCount: 0,
+    };
+  }
+
+  private async stableCompleteProductScans(): Promise<{
+    stableScan: CompleteProductScan;
+    scans: CompleteProductScan[];
+  }> {
+    const scans: CompleteProductScan[] = [];
+    for (let attempt = 1; attempt <= RECENT_PRODUCT_MAX_SCAN_ATTEMPTS; attempt += 1) {
+      const scan = await this.scanAllProducts(attempt);
+      scans.push(scan);
+      const previous = scans.at(-2);
+      if (previous?.fingerprint === scan.fingerprint) {
+        return { stableScan: scan, scans };
+      }
+    }
+    throw new Error(
+      `list_products: catalogue did not produce ${RECENT_PRODUCT_STABLE_SCANS_REQUIRED} ` +
+        `consecutive matching exhaustive scans within ${RECENT_PRODUCT_MAX_SCAN_ATTEMPTS} attempts`
+    );
+  }
+
+  private async scanAllProducts(attempt: number): Promise<CompleteProductScan> {
+    const productsById = new Map<string, Record<string, unknown>>();
+    let pageCount = 0;
+    let recordsFetched = 0;
+    let duplicateRecords = 0;
+    let skip = 0;
+
+    while (pageCount < RECENT_PRODUCT_MAX_PAGES_PER_SCAN) {
+      let rawPage: unknown;
+      try {
+        rawPage = await this.callTool("list_products", {
+          count: PRODUCT_PROVIDER_PAGE_SIZE,
+          skip,
+        });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `list_products: exhaustive scan ${attempt} failed on page ${pageCount + 1} ` +
+            `(skip=${skip}): ${reason}`
+        );
+      }
+
+      const pageItems = this.strictListItems(rawPage, attempt, pageCount + 1, skip);
+      pageCount += 1;
+      if (pageItems.length === 0) break;
+      if (pageItems.length > PRODUCT_PROVIDER_PAGE_SIZE) {
+        throw new Error(
+          `list_products: exhaustive scan ${attempt} returned ${pageItems.length} records ` +
+            `on page ${pageCount}; provider page maximum is ${PRODUCT_PROVIDER_PAGE_SIZE}`
+        );
+      }
+
+      const uniqueCountBeforePage = productsById.size;
+      recordsFetched += pageItems.length;
+      for (const rawProduct of pageItems) {
+        if (!rawProduct || typeof rawProduct !== "object" || Array.isArray(rawProduct)) {
+          throw new Error(
+            `list_products: exhaustive scan ${attempt} page ${pageCount} contains a non-object product`
+          );
+        }
+        const product = rawProduct as Record<string, unknown>;
+        if (
+          typeof product.productId !== "string" ||
+          product.productId.trim() === "" ||
+          product.productId !== product.productId.trim()
+        ) {
+          throw new Error(
+            `list_products: exhaustive scan ${attempt} page ${pageCount} contains a product without a valid productId`
+          );
+        }
+
+        const existing = productsById.get(product.productId);
+        if (existing) {
+          duplicateRecords += 1;
+          if (stableJson(product) !== stableJson(existing)) {
+            throw new Error(
+              `list_products: exhaustive scan ${attempt} observed conflicting records for ` +
+                `productId ${product.productId} on page ${pageCount}`
+            );
+          }
+        } else {
+          productsById.set(product.productId, product);
+        }
+      }
+
+      if (productsById.size === uniqueCountBeforePage) {
+        throw new Error(
+          `list_products: exhaustive scan ${attempt} made no product-ID progress on page ${pageCount} ` +
+            `(skip=${skip}); refusing an incomplete result`
+        );
+      }
+
+      if (pageItems.length < PRODUCT_PROVIDER_PAGE_SIZE) break;
+      skip += pageItems.length;
+    }
+
+    if (pageCount >= RECENT_PRODUCT_MAX_PAGES_PER_SCAN) {
+      throw new Error(
+        `list_products: exhaustive scan ${attempt} exceeded the safety limit of ` +
+          `${RECENT_PRODUCT_MAX_PAGES_PER_SCAN} pages without reaching the end`
+      );
+    }
+
+    const products = [...productsById.values()].sort((left, right) =>
+      String(left.productId).localeCompare(String(right.productId))
+    );
+    const fingerprint = stableJson({
+      products,
+      pageCount,
+      recordsFetched,
+      duplicateRecords,
+    });
+    return { products, pageCount, recordsFetched, duplicateRecords, fingerprint };
+  }
+
+  private strictListItems(
+    response: unknown,
+    attempt: number,
+    page: number,
+    skip: number
+  ): unknown[] {
+    const payload =
+      response && typeof response === "object" && !Array.isArray(response) && "data" in response
+        ? (response as { data: unknown }).data
+        : response;
+    if (!Array.isArray(payload)) {
+      throw new Error(
+        `list_products: exhaustive scan ${attempt} received a malformed page ${page} ` +
+          `(skip=${skip}); expected an array or { data: [] } envelope`
+      );
+    }
+    return payload;
+  }
+
   async getProduct(productId: string, options?: { include?: string[] }): Promise<any> {
     const cacheKey = createCacheKey("product", {
       id: productId,
@@ -263,17 +1113,6 @@ export class InFlowMCPClient {
     );
   }
 
-  /**
-   * Searches products by name, SKU, or description.
-   *
-   * @param query - Search query
-   * @returns Array of matching products
-   *
-   * @cached TTL: 15 minutes
-   *
-   * @example
-   * const results = await client.searchProducts("product");
-   */
   async searchProducts(query: string): Promise<any> {
     const cacheKey = createCacheKey("products_search", { query });
 
@@ -284,42 +1123,335 @@ export class InFlowMCPClient {
     );
   }
 
-  // ============================================
-  // BILL OF MATERIALS
-  // ============================================
 
-  /**
-   * Retrieves bill of materials (components) for a product.
-   *
-   * @param productId - Product ID to get BOM for
-   * @returns Bill of materials with component list
-   *
-   * @cached TTL: 1 hour
-   *
-   * @example
-   * const bom = await client.getBillOfMaterials("prod_123");
-   */
-  async getBillOfMaterials(productId: string): Promise<any> {
-    const cacheKey = createCacheKey("bom", { productId });
+  async getBillOfMaterials(
+    productId: string,
+    options?: { bypassCache?: boolean }
+  ): Promise<any> {
+    const cacheKey = `bom:${productId}`;
 
     return cache.getOrFetch(
       cacheKey,
       () => this.callTool("get_bill_of_materials", { productId }),
-      { ttl: TTL.HOUR, bypassCache: this.cacheDisabled }
+      {
+        ttl: TTL.FIFTEEN_MINUTES,
+        bypassCache:
+          options?.bypassCache === true ||
+          this.cacheBypass([`bom:${productId}`, `product:${productId}`]),
+      }
     );
   }
 
-  // ============================================
-  // CATEGORIES
-  // ============================================
+  async getBillsOfMaterials(
+    productIds: string[]
+  ): Promise<BulkBomReadResult> {
+    if (productIds.length < 2 || productIds.length > 25) {
+      throw new Error("getBillsOfMaterials requires 2-25 product IDs");
+    }
+    if (productIds.some((productId) => productId.trim() === "")) {
+      throw new Error("getBillsOfMaterials requires non-empty product IDs");
+    }
+    if (new Set(productIds).size !== productIds.length) {
+      throw new Error("getBillsOfMaterials requires unique product IDs");
+    }
 
-  /**
-   * Lists all product categories.
-   *
-   * @returns Array of category objects
-   *
-   * @cached TTL: 1 hour
-   */
+    await this.connect();
+
+    const results = new Array<BulkBomReadItem>(productIds.length);
+    let nextRequestNotBefore = this.now();
+
+    for (let index = 0; index < productIds.length; index += 1) {
+      const productId = productIds[index];
+      let lastError: unknown;
+
+      for (let attempt = 1; attempt <= BULK_BOM_MAX_ATTEMPTS_PER_PRODUCT; attempt += 1) {
+        const waitMs = Math.max(0, nextRequestNotBefore - this.now());
+        if (waitMs > 0) {
+          await this.sleep(waitMs);
+        }
+
+        const requestStartedAt = this.now();
+        nextRequestNotBefore = requestStartedAt + BULK_BOM_REQUEST_INTERVAL_MS;
+
+        try {
+          const bom = await this.getBillOfMaterials(productId, {
+            bypassCache: true,
+          });
+          if (isEmptyBomRead(bom)) {
+            cache.invalidate(`bom:${productId}`);
+            throw new Error(`Empty BOM response for product ${productId}`);
+          }
+          results[index] = { productId, status: "ok", bom };
+          break;
+        } catch (error) {
+          lastError = error;
+          const message = error instanceof Error ? error.message : String(error);
+          const retryable = /(?:\b429\b|rate[ -]?limit|empty BOM response)/iu.test(message);
+          if (retryable) {
+            const backoffMs = BULK_BOM_REQUEST_INTERVAL_MS * (2 ** (attempt - 1));
+            nextRequestNotBefore = Math.max(
+              nextRequestNotBefore,
+              this.now() + backoffMs
+            );
+            if (attempt < BULK_BOM_MAX_ATTEMPTS_PER_PRODUCT) {
+              continue;
+            }
+          }
+
+          results[index] = { productId, status: "error", error: message };
+          break;
+        }
+      }
+
+      if (!results[index]) {
+        results[index] = {
+          productId,
+          status: "error",
+          error: lastError instanceof Error ? lastError.message : String(lastError),
+        };
+      }
+    }
+
+    const succeededProductCount = results.filter(
+      (result) => result.status === "ok"
+    ).length;
+    const failedProductCount = results.length - succeededProductCount;
+    const status = failedProductCount === 0
+      ? "complete"
+      : succeededProductCount === 0
+        ? "failed"
+        : "partial";
+
+    return {
+      status,
+      complete: status === "complete",
+      requestedProductCount: productIds.length,
+      succeededProductCount,
+      failedProductCount,
+      concurrency: 1,
+      requestIntervalMs: BULK_BOM_REQUEST_INTERVAL_MS,
+      maxAttemptsPerProduct: BULK_BOM_MAX_ATTEMPTS_PER_PRODUCT,
+      results,
+    };
+  }
+
+  async compareProductBoms(productIds: string[]): Promise<unknown> {
+    const ids = [...productIds].sort();
+    const cacheKey = `bom-compare:${ids.join(",")}`;
+    return cache.getOrFetch(
+      cacheKey,
+      () => this.callTool("compare_product_boms", { productIds: ids }),
+      { ttl: TTL.FIFTEEN_MINUTES, bypassCache: this.cacheBypass(ids.map((id) => `bom:${id}`)) }
+    );
+  }
+
+  async listProductGroups(options?: {
+    skip?: number;
+    count?: number;
+    sort?: string;
+    sortDesc?: boolean;
+    includeCount?: boolean;
+  }): Promise<unknown> {
+    const cacheKey = createCacheKey("product-groups", options ?? {});
+    return cache.getOrFetch(
+      cacheKey,
+      () => this.callTool("list_product_groups", options ?? {}),
+      { ttl: TTL.FIFTEEN_MINUTES, bypassCache: this.cacheDisabled }
+    );
+  }
+
+  async getProductGroup(productGroupId: string): Promise<unknown> {
+    const cacheKey = `product-group:${productGroupId}`;
+    return cache.getOrFetch(
+      cacheKey,
+      () => this.callTool("get_product_group", { productGroupId }),
+      { ttl: TTL.FIFTEEN_MINUTES, bypassCache: this.cacheBypass([`product-group:${productGroupId}`]) }
+    );
+  }
+
+  async getProductGroupVariantQuantities(
+    productGroupId: string,
+    locationId: string
+  ): Promise<unknown> {
+    const cacheKey = `group-qty:${productGroupId}:${locationId}`;
+    return cache.getOrFetch(
+      cacheKey,
+      () =>
+        this.callTool("get_product_group_variant_quantities", {
+          productGroupId,
+          locationId,
+        }),
+      { ttl: TTL.FIFTEEN_MINUTES, bypassCache: this.cacheBypass([`group-qty:${productGroupId}`]) }
+    );
+  }
+
+  async setProductManufacturingConfig(
+    request: ManufacturingConfigRequest
+  ): Promise<unknown> {
+    const fallbackTags = [`product:${request.productId}`, `bom:${request.productId}`];
+    const { operationId, ...toolRequest } = request;
+    let result: ManufacturingConfigMutationEnvelope;
+    try {
+      result = await this.callTool("set_product_manufacturing_config", toolRequest);
+    } catch (error) {
+      if (request.dryRun === false) this.handleApplyException(error, operationId, fallbackTags);
+      throw error;
+    }
+    if (result?.cacheInvalidationRequired === true || result?.appliedMayBeTrue === true || result?.applied === true) {
+      const escapedId = request.productId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      cache.invalidate(`bom:${request.productId}`);
+      cache.invalidatePattern(
+        `^bom-compare:(?:[^,]+,)*${escapedId}(?:,|$)`
+      );
+      cache.invalidatePattern(
+        `^product\\?id=${escapedId}(?:&|$)`
+      );
+      cache.invalidate(
+        createCacheKey("product_bom", { productId: request.productId })
+      );
+      cache.invalidatePattern(/^products(?:\?|_|$)/);
+      cache.invalidate(createCacheKey("stock", { productId: request.productId }));
+
+      const groupId =
+        result?.actual?.productVariant?.productGroupId ??
+        result?.before?.productVariant?.productGroupId;
+      if (typeof groupId === "string" && groupId.length > 0) {
+        cache.invalidatePattern(`^group-qty:${groupId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:`);
+      }
+    }
+    if (result?.applicationState && result?.operationId) {
+      this.handleMutationResult(result as MutationResult, fallbackTags);
+    }
+    return result;
+  }
+
+  async getMcpStatus(probeApi = false): Promise<unknown> {
+    return this.callTool("get_mcp_status", { probeApi });
+  }
+
+  async getMutationStatus(operationId: string, reconcile = false): Promise<unknown> {
+    const result = await this.callTool("get_mutation_status", { operationId, reconcile });
+    const state = result?.mutation?.applicationState ?? result?.applicationState ?? result?.record?.state;
+    if (["applied_verified", "no_op", "not_applied", "conflict"].includes(state)) {
+      this.quarantine.clear(operationId);
+    }
+    return result;
+  }
+
+  async listOperationTypes(options: Record<string, unknown> = {}): Promise<unknown> {
+    const key = createCacheKey("operation-types", { request: JSON.stringify(options) });
+    return cache.getOrFetch(key, () => this.callTool("list_operation_types", options), {
+      ttl: TTL.FIFTEEN_MINUTES,
+      bypassCache: this.cacheBypass(["operation-types"]),
+    });
+  }
+
+  async getOperationType(operationTypeId: string): Promise<unknown> {
+    const key = `operation-type:${operationTypeId}`;
+    return cache.getOrFetch(key, () => this.callTool("get_operation_type", { operationTypeId }), {
+      ttl: TTL.FIFTEEN_MINUTES,
+      bypassCache: this.cacheBypass([key]),
+    });
+  }
+
+  async getProductPrices(productId: string): Promise<unknown> {
+    const key = `prices:${productId}`;
+    return cache.getOrFetch(key, () => this.callTool("get_product_prices", { productId }), {
+      ttl: TTL.FIFTEEN_MINUTES,
+      bypassCache: this.cacheBypass([key, `product:${productId}`]),
+    });
+  }
+
+  async setProductPrices(request: Record<string, unknown>, apply = false): Promise<MutationResult> {
+    const productId = String(request.productId);
+    return this.previewThenApply("set_product_prices", request, apply, [`product:${productId}`, `prices:${productId}`]);
+  }
+
+  async copyProductManufacturingConfig(request: Record<string, unknown>): Promise<MutationResult> {
+    const targetId = String(request.targetProductId);
+    const operationId = typeof request.operationId === "string"
+      ? request.operationId
+      : undefined;
+    const { operationId: _operationId, ...toolRequest } = request;
+    try {
+      const result = await this.callTool(
+        "copy_product_manufacturing_config",
+        toolRequest,
+      ) as MutationResult;
+      return this.handleMutationResult(result, [
+        `product:${targetId}`,
+        `bom:${targetId}`,
+      ]);
+    } catch (error) {
+      if (request.dryRun === false) {
+        return this.handleApplyException(error, operationId, [
+          `product:${targetId}`,
+          `bom:${targetId}`,
+        ]);
+      }
+      throw error;
+    }
+  }
+
+  async auditProductGroupManufacturing(request: Record<string, unknown>): Promise<unknown> {
+    const groupId = String(request.productGroupId);
+    const key = createCacheKey(`group-audit:${groupId}`, { request: JSON.stringify(request) });
+    return cache.getOrFetch(key, () => this.callTool("audit_product_group_manufacturing", request), {
+      ttl: TTL.FIFTEEN_MINUTES,
+      bypassCache: this.cacheBypass([`product-group:${groupId}`, `group-qty:${groupId}`]),
+    });
+  }
+
+  async calculateBomRequirements(request: Record<string, unknown>): Promise<unknown> {
+    const productId = String(request.productId);
+    const key = createCacheKey(`bom-requirements:${productId}`, { request: JSON.stringify(request) });
+    return cache.getOrFetch(key, () => this.callTool("calculate_bom_requirements", request), {
+      ttl: TTL.FIFTEEN_MINUTES,
+      bypassCache: this.cacheBypass([`bom:${productId}`, "inventory:stock"]),
+    });
+  }
+
+  async getManufacturingOrderTrace(manufacturingOrderId: string): Promise<unknown> {
+    const key = `mo-trace:${manufacturingOrderId}`;
+    return cache.getOrFetch(key, () => this.callTool("get_manufacturing_order_trace", { manufacturingOrderId }), {
+      ttl: TTL.FIFTEEN_MINUTES,
+      bypassCache: this.cacheBypass([`mo:${manufacturingOrderId}`, "inventory:serials"]),
+    });
+  }
+
+  async reconcileManufacturingOrderSerials(request: Record<string, unknown>, apply = false): Promise<MutationResult> {
+    const id = String(request.manufacturingOrderId);
+    return this.previewThenApply("reconcile_manufacturing_order_serials", request, apply, [`mo:${id}`, "inventory:serials"]);
+  }
+
+  async setProductGroupConfig(request: Record<string, unknown>, apply = false): Promise<MutationResult> {
+    const id = String(request.productGroupId);
+    return this.previewThenApply("set_product_group_config", request, apply, [`product-group:${id}`, `group-qty:${id}`]);
+  }
+
+  async createProductGroupVariants(request: Record<string, unknown>, apply = false): Promise<MutationResult> {
+    const id = String(request.productGroupId);
+    return this.previewThenApply("create_product_group_variants", request, apply, [`product-group:${id}`, `group-qty:${id}`, "products:list"]);
+  }
+
+  async safeSet(
+    tool: string,
+    request: Record<string, unknown>,
+    apply = false,
+    tags: string[] = [],
+    reviewedPreview?: MutationResult,
+  ): Promise<MutationResult> {
+    if (!apply) return this.previewThenApply(tool, request, false, tags);
+    if (!reviewedPreview) {
+      await this.previewThenApply(tool, request, false, tags);
+      throw new Error(
+        "USER_CONFIRMATION_REQUIRED: generic safe-set apply requires a freshly regenerated and externally reviewed preview",
+      );
+    }
+    return this.applyFromPreview(tool, request, reviewedPreview, tags);
+  }
+
+
   async listCategories(): Promise<any> {
     return cache.getOrFetch(
       "categories",
@@ -328,14 +1460,6 @@ export class InFlowMCPClient {
     );
   }
 
-  /**
-   * Retrieves a product with its bill of materials included.
-   *
-   * @param productId - Product ID
-   * @returns Product with itemBoms field populated
-   *
-   * @cached TTL: 15 minutes
-   */
   async getProductWithBom(productId: string): Promise<any> {
     const cacheKey = createCacheKey("product_bom", { productId });
 
@@ -346,22 +1470,7 @@ export class InFlowMCPClient {
     );
   }
 
-  // ============================================
-  // STOCK & INVENTORY
-  // ============================================
 
-  /**
-   * Gets stock levels/inventory summary for a product.
-   *
-   * @param productId - Product ID (required)
-   * @returns Inventory summary with quantities per location
-   * @throws {Error} If productId not provided
-   *
-   * @cached TTL: 5 minutes
-   *
-   * @example
-   * const stock = await client.getStockLevels("prod_123");
-   */
   async getStockLevels(productId?: string): Promise<any> {
     if (!productId) {
       throw new Error("productId is required for get_inventory_summary. Use list-products first to get product IDs.");
@@ -377,28 +1486,13 @@ export class InFlowMCPClient {
   }
 
   /**
-   * Gets stock by location (not directly supported).
-   *
-   * @throws {Error} Always throws - use listProducts + getStockLevels instead
-   * @deprecated Use listProducts then getStockLevels for each product
-   */
+ * @deprecated
+ */
   async getStockByLocation(locationId?: string): Promise<any> {
     throw new Error("Stock by location requires listing products first, then calling get-stock-levels for each. This command is not directly supported.");
   }
 
-  // ============================================
-  // STOCK ADJUSTMENTS
-  // ============================================
 
-  /**
-   * Lists stock adjustment records.
-   *
-   * @param options - Filter options
-   * @param options.limit - Maximum adjustments to return
-   * @returns Array of stock adjustments
-   *
-   * @cached TTL: 5 minutes
-   */
   async listStockAdjustments(options?: { limit?: number }): Promise<any> {
     const cacheKey = createCacheKey("stock_adjustments", { limit: options?.limit });
 
@@ -413,31 +1507,6 @@ export class InFlowMCPClient {
     );
   }
 
-  /**
-   * Creates a stock adjustment to add or remove inventory.
-   *
-   * @param data - Adjustment data
-   * @param data.locationId - Location ID for the adjustment
-   * @param data.reasonId - Adjustment reason ID
-   * @param data.items - Array of items to adjust
-   * @param data.items[].productId - Product ID
-   * @param data.items[].quantity - Quantity to adjust (positive to add, negative to remove)
-   * @param data.items[].sublocation - Optional sublocation
-   * @param data.items[].serialNumbers - Serial numbers/serial numbers for serialized items
-   * @param data.items[].unitCost - Unit cost for costing
-   * @param data.remarks - Notes for the adjustment
-   * @param data.adjustmentDate - Date of adjustment (ISO 8601)
-   * @returns Created adjustment object
-   *
-   * @invalidates stock/*
-   *
-   * @example
-   * await client.createStockAdjustment({
-   *   locationId: "loc_warehouse",
-   *   items: [{ productId: "prod_123", quantity: 5 }],
-   *   remarks: "Received stock"
-   * });
-   */
   async createStockAdjustment(data: {
     locationId: string;
     reasonId?: string;
@@ -451,20 +1520,21 @@ export class InFlowMCPClient {
     remarks?: string;
     adjustmentDate?: string;
   }): Promise<any> {
-    const result = await this.callTool("upsert_stock_adjustment", data);
-    // Invalidate stock caches after mutation
-    cache.invalidatePattern(/^stock/);
-    return result;
+    const values = compactDefined({
+      date: data.adjustmentDate,
+      locationId: data.locationId,
+      adjustmentReasonId: data.reasonId,
+      items: data.items,
+      remarks: data.remarks,
+    }) as Record<string, unknown>;
+    return this.previewThenApply(
+      "set_stock_adjustment",
+      { mode: "replace", values },
+      true,
+      ["inventory:stock", ...data.items.map((item) => `product:${item.productId}`)],
+    );
   }
 
-  /**
-   * Retrieves a single stock adjustment by ID.
-   *
-   * @param adjustmentId - Adjustment ID
-   * @returns Stock adjustment object
-   *
-   * @cached TTL: 5 minutes
-   */
   async getStockAdjustment(adjustmentId: string): Promise<any> {
     const cacheKey = createCacheKey("stock_adjustment", { id: adjustmentId });
 
@@ -475,25 +1545,7 @@ export class InFlowMCPClient {
     );
   }
 
-  // ============================================
-  // STOCK TRANSFERS
-  // ============================================
 
-  /**
-   * Lists stock transfer records.
-   *
-   * @param options - Filter options
-   * @param options.limit - Maximum transfers to return
-   * @param options.status - Filter by status
-   * @param options.fromLocationId - Filter by source location
-   * @param options.toLocationId - Filter by destination location
-   * @returns Array of stock transfers
-   *
-   * @cached TTL: 5 minutes
-   *
-   * @example
-   * const transfers = await client.listStockTransfers({ status: "Pending" });
-   */
   async listStockTransfers(options?: {
     limit?: number;
     status?: string;
@@ -511,24 +1563,15 @@ export class InFlowMCPClient {
       cacheKey,
       async () => {
         const args: Record<string, any> = {};
-        if (options?.limit) args.count = options.limit;
         if (options?.status) args.status = options.status;
         if (options?.fromLocationId) args.fromLocationId = options.fromLocationId;
         if (options?.toLocationId) args.toLocationId = options.toLocationId;
-        return this.callTool("list_stock_transfers", args);
+        return this.callListToolPaged("list_stock_transfers", args, options?.limit, 0);
       },
       { ttl: TTL.FIVE_MINUTES, bypassCache: this.cacheDisabled }
     );
   }
 
-  /**
-   * Retrieves a single stock transfer by ID.
-   *
-   * @param transferId - Transfer ID
-   * @returns Stock transfer object
-   *
-   * @cached TTL: 5 minutes
-   */
   async getStockTransfer(transferId: string): Promise<any> {
     const cacheKey = createCacheKey("stock_transfer", { id: transferId });
 
@@ -539,31 +1582,6 @@ export class InFlowMCPClient {
     );
   }
 
-  /**
-   * Creates a stock transfer between locations.
-   *
-   * @param data - Transfer data
-   * @param data.fromLocationId - Source location ID
-   * @param data.toLocationId - Destination location ID
-   * @param data.items - Array of items to transfer
-   * @param data.items[].productId - Product ID
-   * @param data.items[].quantity - Quantity to transfer
-   * @param data.items[].fromSublocation - Source sublocation
-   * @param data.items[].toSublocation - Destination sublocation
-   * @param data.items[].serialNumbers - Serial numbers for serialized items
-   * @param data.remarks - Notes for the transfer
-   * @param data.transferDate - Date of transfer (ISO 8601)
-   * @returns Created transfer object
-   *
-   * @invalidates stock/*
-   *
-   * @example
-   * await client.createStockTransfer({
-   *   fromLocationId: "loc_warehouse",
-   *   toLocationId: "loc_showroom",
-   *   items: [{ productId: "prod_123", quantity: 2 }]
-   * });
-   */
   async createStockTransfer(data: {
     fromLocationId: string;
     toLocationId: string;
@@ -577,27 +1595,22 @@ export class InFlowMCPClient {
     remarks?: string;
     transferDate?: string;
   }): Promise<any> {
-    const result = await this.callTool("upsert_stock_transfer", data);
-    // Invalidate stock caches after mutation
-    cache.invalidatePattern(/^stock/);
-    return result;
+    const values = compactDefined({
+      transferDate: data.transferDate,
+      fromLocationId: data.fromLocationId,
+      toLocationId: data.toLocationId,
+      items: data.items,
+      remarks: data.remarks,
+    }) as Record<string, unknown>;
+    return this.previewThenApply(
+      "set_stock_transfer",
+      { mode: "replace", values },
+      true,
+      ["inventory:stock", ...data.items.map((item) => `product:${item.productId}`)],
+    );
   }
 
-  // ============================================
-  // STOCK COUNTS
-  // ============================================
 
-  /**
-   * Lists stock count records (physical inventory counts).
-   *
-   * @param options - Filter options
-   * @param options.limit - Maximum counts to return
-   * @param options.status - Filter by status
-   * @param options.locationId - Filter by location
-   * @returns Array of stock counts
-   *
-   * @cached TTL: 5 minutes
-   */
   async listStockCounts(options?: {
     limit?: number;
     status?: string;
@@ -613,23 +1626,14 @@ export class InFlowMCPClient {
       cacheKey,
       async () => {
         const args: Record<string, any> = {};
-        if (options?.limit) args.count = options.limit;
         if (options?.status) args.status = options.status;
         if (options?.locationId) args.locationId = options.locationId;
-        return this.callTool("list_stock_counts", args);
+        return this.callListToolPaged("list_stock_counts", args, options?.limit, 0);
       },
       { ttl: TTL.FIVE_MINUTES, bypassCache: this.cacheDisabled }
     );
   }
 
-  /**
-   * Retrieves a single stock count by ID.
-   *
-   * @param stockCountId - Stock count ID
-   * @returns Stock count object
-   *
-   * @cached TTL: 5 minutes
-   */
   async getStockCount(stockCountId: string): Promise<any> {
     const cacheKey = createCacheKey("stock_count", { id: stockCountId });
 
@@ -640,39 +1644,25 @@ export class InFlowMCPClient {
     );
   }
 
-  /**
-   * Creates a new stock count (physical inventory count).
-   *
-   * @param data - Stock count data
-   * @param data.locationId - Location to count
-   * @param data.remarks - Notes for the count
-   * @param data.countDate - Date of count (ISO 8601)
-   * @returns Created stock count object
-   *
-   * @invalidates stock/*
-   */
   async createStockCount(data: {
     locationId: string;
     remarks?: string;
     countDate?: string;
   }): Promise<any> {
-    const result = await this.callTool("upsert_stock_count", data);
-    // Invalidate stock caches after mutation
-    cache.invalidatePattern(/^stock/);
-    return result;
+    const values = compactDefined({
+      countDate: data.countDate,
+      locationId: data.locationId,
+      remarks: data.remarks,
+    }) as Record<string, unknown>;
+    return this.previewThenApply(
+      "set_stock_count",
+      { mode: "replace", values },
+      true,
+      ["inventory:stock", `location:${data.locationId}`],
+    );
   }
 
-  // ============================================
-  // ADJUSTMENT REASONS
-  // ============================================
 
-  /**
-   * Lists available stock adjustment reasons.
-   *
-   * @returns Array of adjustment reason objects
-   *
-   * @cached TTL: 1 hour
-   */
   async listAdjustmentReasons(): Promise<any> {
     return cache.getOrFetch(
       "adjustment_reasons",
@@ -681,25 +1671,7 @@ export class InFlowMCPClient {
     );
   }
 
-  // ============================================
-  // SALES ORDERS
-  // ============================================
 
-  /**
-   * Lists sales orders with optional filtering.
-   *
-   * @param options - Filter options
-   * @param options.limit - Maximum orders to return
-   * @param options.skip - Number of orders to skip (pagination)
-   * @param options.status - Filter by status
-   * @param options.include - Related data to include (e.g., ["lines"])
-   * @returns Array of sales orders
-   *
-   * @cached TTL: 5 minutes
-   *
-   * @example
-   * const orders = await client.listSalesOrders({ status: "Open", limit: 50 });
-   */
   async listSalesOrders(options?: {
     limit?: number;
     skip?: number;
@@ -717,29 +1689,14 @@ export class InFlowMCPClient {
       cacheKey,
       async () => {
         const args: Record<string, any> = {};
-        if (options?.limit) args.count = options.limit;
-        if (options?.skip) args.skip = options.skip;
         if (options?.status) args.status = options.status;
         if (options?.include) args.include = options.include;
-        return this.callTool("list_sales_orders", args);
+        return this.callListToolPaged("list_sales_orders", args, options?.limit, options?.skip ?? 0);
       },
       { ttl: TTL.FIVE_MINUTES, bypassCache: this.cacheDisabled }
     );
   }
 
-  /**
-   * Retrieves a single sales order by ID.
-   *
-   * @param orderId - Sales order ID
-   * @param options - Additional options
-   * @param options.include - Related data to include (e.g., ["lines"])
-   * @returns Sales order object
-   *
-   * @cached TTL: 5 minutes
-   *
-   * @example
-   * const order = await client.getSalesOrder("so_123", { include: ["lines"] });
-   */
   async getSalesOrder(orderId: string, options?: { include?: string[] }): Promise<any> {
     const cacheKey = createCacheKey("sales_order", {
       id: orderId,
@@ -757,14 +1714,6 @@ export class InFlowMCPClient {
     );
   }
 
-  /**
-   * Searches sales orders by query.
-   *
-   * @param query - Search query (searches order number, customer, etc.)
-   * @returns Array of matching sales orders
-   *
-   * @cached TTL: 5 minutes
-   */
   async searchSalesOrders(query: string): Promise<any> {
     const cacheKey = createCacheKey("sales_orders_search", { query });
 
@@ -775,22 +1724,7 @@ export class InFlowMCPClient {
     );
   }
 
-  // ============================================
-  // PURCHASE ORDERS
-  // ============================================
 
-  /**
-   * Lists purchase orders with optional filtering.
-   *
-   * @param options - Filter options
-   * @param options.limit - Maximum orders to return
-   * @param options.skip - Number of orders to skip (pagination)
-   * @param options.status - Filter by status
-   * @param options.include - Related data to include (e.g., ["lines"])
-   * @returns Array of purchase orders
-   *
-   * @cached TTL: 5 minutes
-   */
   async listPurchaseOrders(options?: {
     limit?: number;
     skip?: number;
@@ -808,26 +1742,19 @@ export class InFlowMCPClient {
       cacheKey,
       async () => {
         const args: Record<string, any> = {};
-        if (options?.limit) args.count = options.limit;
-        if (options?.skip) args.skip = options.skip;
         if (options?.status) args.status = options.status;
         if (options?.include) args.include = options.include;
-        return this.callTool("list_purchase_orders", args);
+        return this.callListToolPaged(
+          "list_purchase_orders",
+          args,
+          options?.limit,
+          options?.skip ?? 0
+        );
       },
       { ttl: TTL.FIVE_MINUTES, bypassCache: this.cacheDisabled }
     );
   }
 
-  /**
-   * Retrieves a single purchase order by ID.
-   *
-   * @param orderId - Purchase order ID
-   * @param options - Additional options
-   * @param options.include - Related data to include (e.g., ["lines"])
-   * @returns Purchase order object
-   *
-   * @cached TTL: 5 minutes
-   */
   async getPurchaseOrder(orderId: string, options?: { include?: string[] }): Promise<any> {
     const cacheKey = createCacheKey("purchase_order", {
       id: orderId,
@@ -845,17 +1772,7 @@ export class InFlowMCPClient {
     );
   }
 
-  // ============================================
-  // LOCATIONS
-  // ============================================
 
-  /**
-   * Lists all warehouse locations.
-   *
-   * @returns Array of location objects
-   *
-   * @cached TTL: 1 hour
-   */
   async listLocations(): Promise<any> {
     return cache.getOrFetch(
       "locations",
@@ -864,14 +1781,6 @@ export class InFlowMCPClient {
     );
   }
 
-  /**
-   * Retrieves a single location by ID.
-   *
-   * @param locationId - Location ID
-   * @returns Location object
-   *
-   * @cached TTL: 1 hour
-   */
   async getLocation(locationId: string): Promise<any> {
     const cacheKey = createCacheKey("location", { id: locationId });
 
@@ -882,33 +1791,15 @@ export class InFlowMCPClient {
     );
   }
 
-  // ============================================
-  // SERIAL NUMBERS (serial numbers) - ORDER-BASED
-  // ============================================
 
-  // Note: inFlow has NO direct serial search API. We fetch orders with include=lines and extract serialNumbers.
-  // The serial index is built from fulfilled sales orders and cached for 1 hour.
 
-  /**
-   * Extracts serial numbers/serial numbers from a specific sales order.
-   *
-   * @param orderId - Sales order ID
-   * @returns Object with order info and extracted serial numbers
-   *
-   * @example
-   * const result = await client.getSalesOrderSerials("so_123");
-   * // Returns: { salesOrderId, orderNumber, serialCount, serials: [...] }
-   */
   async getSalesOrderSerials(orderId: string): Promise<any> {
     const order = await this.getSalesOrder(orderId, {
       include: ['lines', 'pickLines', 'packLines']
     });
 
-    // Track serial numbers with all sources where they appear
     const serialMap = new Map<string, { serial: string; productId: string; sources: string[] }>();
 
-    // Helper to extract serial numbers from a line array
-    // Priority: packLines (most authoritative) > pickLines > lines
     const extractSerials = (lines: any[], source: string) => {
       for (const line of lines || []) {
         const serialNumbers = line.quantity?.serialNumbers;
@@ -931,7 +1822,6 @@ export class InFlowMCPClient {
       }
     };
 
-    // Check all three sources (packLines most authoritative for fulfilled orders)
     extractSerials(order.packLines, 'pack');
     extractSerials(order.pickLines, 'pick');
     extractSerials(order.lines, 'order');
@@ -948,12 +1838,6 @@ export class InFlowMCPClient {
     };
   }
 
-  /**
-   * Extracts serial numbers/serial numbers from a specific purchase order.
-   *
-   * @param orderId - Purchase order ID
-   * @returns Object with order info and extracted serial numbers
-   */
   async getPurchaseOrderSerials(orderId: string): Promise<any> {
     const order = await this.getPurchaseOrder(orderId, { include: ['lines'] });
     const serials: Array<{ serial: string; productId: string; lineId: string }> = [];
@@ -979,19 +1863,6 @@ export class InFlowMCPClient {
     };
   }
 
-  /**
-   * Builds serial index from fulfilled sales orders.
-   *
-   * This is an expensive operation - fetches all fulfilled orders to build the index.
-   * Results are cached for 1 hour. Uses plain object for cache serialization compatibility.
-   *
-   * @param options - Build options
-   * @param options.status - Order status to index (default: "Fulfilled")
-   * @param options.limit - Maximum orders to process
-   * @returns serial → order mapping object
-   *
-   * @cached TTL: 1 hour (via searchSerial)
-   */
   async buildSerialIndex(options?: {
     status?: string;
     limit?: number;
@@ -999,7 +1870,6 @@ export class InFlowMCPClient {
     const status = options?.status || 'Fulfilled';
     const maxOrders = options?.limit;
 
-    // Fetch all orders with specified status
     const allOrders: any[] = [];
     let skip = 0;
     const pageSize = 100;
@@ -1024,10 +1894,8 @@ export class InFlowMCPClient {
       skip += pageSize;
     }
 
-    // Build serial -> order mapping (using plain object for cache compatibility)
     const serialIndex: Record<string, any> = {};
 
-    // Helper to extract serial numbers from a line array
     const extractFromLines = (lines: any[], order: any) => {
       for (const line of lines || []) {
         const serialNumbers = line.quantity?.serialNumbers;
@@ -1036,7 +1904,6 @@ export class InFlowMCPClient {
         for (const serial of serialNumbers) {
           if (!serial) continue;
           const normalizedSerial = serial.trim().toUpperCase();
-          // Only add if not already present (first source wins, packLines checked first)
           if (!serialIndex[normalizedSerial]) {
             serialIndex[normalizedSerial] = {
               serial: normalizedSerial,
@@ -1052,7 +1919,6 @@ export class InFlowMCPClient {
     };
 
     for (const order of allOrders) {
-      // Check all three sources (packLines most authoritative for fulfilled orders)
       extractFromLines(order.packLines, order);
       extractFromLines(order.pickLines, order);
       extractFromLines(order.lines, order);
@@ -1061,27 +1927,9 @@ export class InFlowMCPClient {
     return serialIndex;
   }
 
-  /**
-   * Searches for a serial number across fulfilled sales orders.
-   *
-   * Builds/uses cached serial index. For faster product-based lookup,
-   * use searchSerialByProduct() instead.
-   *
-   * @param serial - serial number to search for
-   * @returns Object with found status and order details if found
-   *
-   * @cached TTL: 1 hour (index is cached)
-   *
-   * @example
-   * const result = await client.searchSerial("L9EXXX12345");
-   * if (result.found) {
-   *   console.log(result.salesOrderId, result.orderNumber);
-   * }
-   */
   async searchSerial(serial: string): Promise<any> {
     const cacheKey = "serial_index";
 
-    // Get or build the serial index
     const serialIndex = await cache.getOrFetch(
       cacheKey,
       () => this.buildSerialIndex(),
@@ -1105,16 +1953,6 @@ export class InFlowMCPClient {
     };
   }
 
-  /**
-   * Lists all serial numbers from fulfilled orders with optional filtering.
-   *
-   * @param options - Filter options
-   * @param options.limit - Maximum serial numbers to return
-   * @param options.productId - Filter by product ID
-   * @returns Object with count and serial numbers array
-   *
-   * @cached TTL: 1 hour (index is cached)
-   */
   async listSerials(options?: {
     limit?: number;
     productId?: string;
@@ -1129,12 +1967,10 @@ export class InFlowMCPClient {
 
     let serials = Object.values(serialIndex);
 
-    // Filter by product if specified
     if (options?.productId) {
       serials = serials.filter(v => v.productId === options.productId);
     }
 
-    // Apply limit
     if (options?.limit && options.limit < serials.length) {
       serials = serials.slice(0, options.limit);
     }
@@ -1146,23 +1982,7 @@ export class InFlowMCPClient {
     };
   }
 
-  // ============================================
-  // SERIAL NUMBERS (serial numbers) - PRODUCT-BASED
-  // ============================================
 
-  /**
-   * Gets all serials (serial numbers) for a specific product using inventoryLines.
-   *
-   * Much faster than order-based lookup. Returns serials with stock status.
-   *
-   * @param productId - Product ID
-   * @returns Object with serials array including stock status per serial
-   *
-   * @cached TTL: 15 minutes
-   *
-   * @example
-   * const serials = await client.getProductSerials("prod_123");
-   */
   async getProductSerials(productId: string): Promise<any> {
     const cacheKey = createCacheKey("product_serials", { productId });
 
@@ -1175,18 +1995,6 @@ export class InFlowMCPClient {
     );
   }
 
-  /**
-   * Lists all serials (serial numbers) across ALL products that track serials.
-   *
-   * Uses inventoryLines for fast retrieval.
-   *
-   * @param options - Filter options
-   * @param options.maxProducts - Maximum products to scan
-   * @param options.inStockOnly - Only return serials currently in stock
-   * @returns Object with serials array
-   *
-   * @cached TTL: 15 minutes
-   */
   async listAllSerials(options?: {
     maxProducts?: number;
     inStockOnly?: boolean;
@@ -1208,15 +2016,6 @@ export class InFlowMCPClient {
     );
   }
 
-  /**
-   * Builds serial index from products using inventoryLines (faster than order-based).
-   *
-   * @param options - Build options
-   * @param options.maxProducts - Maximum products to scan
-   * @returns serial → product mapping object
-   *
-   * @cached TTL: 15 minutes (via searchSerialByProduct)
-   */
   async buildSerialIndexFromProducts(options?: {
     maxProducts?: number;
   }): Promise<Record<string, any>> {
@@ -1241,22 +2040,6 @@ export class InFlowMCPClient {
     return serialIndex;
   }
 
-  /**
-   * Searches for a serial number using product-based index (faster than order-based).
-   *
-   * Note: Does NOT return order info - use searchSerial() for order details.
-   *
-   * @param serial - serial number to search for
-   * @returns Object with found status and product/stock details if found
-   *
-   * @cached TTL: 15 minutes (index is cached)
-   *
-   * @example
-   * const result = await client.searchSerialByProduct("L9EXXX12345");
-   * if (result.found) {
-   *   console.log(result.productName, result.inStock);
-   * }
-   */
   async searchSerialByProduct(serial: string): Promise<any> {
     const cacheKey = "serial_index_products";
 
@@ -1283,44 +2066,29 @@ export class InFlowMCPClient {
     };
   }
 
-  // ============================================
-  // LEGACY METHODS
-  // ============================================
 
   /**
-   * @deprecated Use listSerials() instead
-   */
+ * @deprecated
+ */
   async listSerialNumbers(options?: { productId?: string; limit?: number }): Promise<any> {
     return this.listSerials(options);
   }
 
   /**
-   * @deprecated Use searchSerial() instead
-   */
+ * @deprecated
+ */
   async getSerialNumber(serialNumber: string): Promise<any> {
     return this.searchSerial(serialNumber);
   }
 
   /**
-   * @deprecated Use searchSerial() instead
-   */
+ * @deprecated
+ */
   async searchSerialNumbers(query: string): Promise<any> {
     return this.searchSerial(query);
   }
 
-  // ============================================
-  // CUSTOMERS & VENDORS
-  // ============================================
 
-  /**
-   * Lists customers.
-   *
-   * @param options - Filter options
-   * @param options.limit - Maximum customers to return
-   * @returns Array of customer objects
-   *
-   * @cached TTL: 15 minutes
-   */
   async listCustomers(options?: { limit?: number }): Promise<any> {
     const cacheKey = createCacheKey("customers", { limit: options?.limit });
 
@@ -1335,15 +2103,6 @@ export class InFlowMCPClient {
     );
   }
 
-  /**
-   * Lists vendors/suppliers.
-   *
-   * @param options - Filter options
-   * @param options.limit - Maximum vendors to return
-   * @returns Array of vendor objects
-   *
-   * @cached TTL: 15 minutes
-   */
   async listVendors(options?: { limit?: number }): Promise<any> {
     const cacheKey = createCacheKey("vendors", { limit: options?.limit });
 
@@ -1358,40 +2117,7 @@ export class InFlowMCPClient {
     );
   }
 
-  // ============================================
-  // PRODUCT WRITE OPERATIONS
-  // ============================================
 
-  /**
-   * Creates a new product or updates an existing one.
-   *
-   * @param data - Product data
-   * @param data.id - Product ID (for updates, omit for create)
-   * @param data.name - Product name (required)
-   * @param data.sku - Product SKU
-   * @param data.description - Product description
-   * @param data.categoryId - Category ID
-   * @param data.cost - Unit cost
-   * @param data.defaultPrice - Default selling price
-   * @param data.barcode - Product barcode
-   * @param data.reorderPoint - Reorder point quantity
-   * @param data.reorderQuantity - Reorder quantity
-   * @param data.weight - Product weight
-   * @param data.weightUnit - Weight unit (kg, lb, etc.)
-   * @param data.isActive - Whether product is active
-   * @param data.customFields - Custom field values
-   * @param data.timestamp - Required for updates (optimistic locking)
-   * @returns Created/updated product object
-   *
-   * @invalidates products, product:*, products_search, product_bom, bom
-   *
-   * @example
-   * // Create a new product
-   * await client.upsertProduct({ name: "HDPE Pallet", sku: "PALLET-001", cost: 72 });
-   *
-   * // Update existing product (must include timestamp)
-   * await client.upsertProduct({ id: "prod_123", name: "Updated Name", timestamp: "..." });
-   */
   async upsertProduct(data: {
     id?: string;
     name: string;
@@ -1400,6 +2126,7 @@ export class InFlowMCPClient {
     categoryId?: string;
     cost?: number;
     defaultPrice?: number;
+    prices?: unknown[];
     barcode?: string;
     reorderPoint?: number;
     reorderQuantity?: number;
@@ -1409,63 +2136,26 @@ export class InFlowMCPClient {
     customFields?: Record<string, unknown>;
     timestamp?: string;
   }): Promise<any> {
-    const result = await this.callTool("upsert_product", data);
-    // Comprehensive cache invalidation (per Codex review)
-    cache.invalidatePattern(/^products/);
-    cache.invalidatePattern(/^product:/);
-    cache.invalidatePattern(/^products_search/);
-    cache.invalidatePattern(/^product_bom/);
-    cache.invalidatePattern(/^bom/);
-    return result;
+    if (data.defaultPrice !== undefined || data.prices !== undefined) {
+      throw new Error(
+        "OPERATION_UNSUPPORTED: price fields cannot be mixed into set_product; use setProductPrices explicitly",
+      );
+    }
+    const { id, timestamp: _timestamp, defaultPrice: _defaultPrice, prices: _prices, ...rawValues } = data;
+    const values = compactDefined(rawValues) as Record<string, unknown>;
+    return this.previewThenApply(
+      "set_product",
+      { ...(id ? { productId: id } : {}), mode: id ? "patch" : "replace", values },
+      true,
+      [`product:${id ?? "new"}`, `bom:${id ?? "new"}`],
+    );
   }
 
-  // ============================================
-  // VENDOR WRITE OPERATIONS
-  // ============================================
 
-  /**
-   * Gets a single vendor by ID (bypasses cache for fresh timestamp).
-   *
-   * Required for update operations to get current timestamp for optimistic locking.
-   *
-   * @param vendorId - Vendor ID
-   * @returns Vendor object with current timestamp
-   */
   async getVendor(vendorId: string): Promise<any> {
-    // Always bypass cache to get fresh timestamp for updates
     return this.callTool("get_vendor", { vendorId });
   }
 
-  /**
-   * Creates a new vendor or updates an existing one.
-   *
-   * @param data - Vendor data
-   * @param data.id - Vendor ID (for updates, omit for create)
-   * @param data.name - Vendor name (required)
-   * @param data.email - Email address
-   * @param data.phone - Phone number
-   * @param data.fax - Fax number
-   * @param data.website - Website URL
-   * @param data.address - Address object
-   * @param data.paymentTermsId - Payment terms ID
-   * @param data.currencyCode - Currency code (GBP, USD, etc.)
-   * @param data.contacts - Array of contact objects
-   * @param data.customFields - Custom field values
-   * @param data.isActive - Whether vendor is active
-   * @param data.timestamp - Required for updates (optimistic locking)
-   * @returns Created/updated vendor object
-   *
-   * @invalidates vendors
-   *
-   * @example
-   * // Create a new vendor
-   * await client.upsertVendor({
-   *   name: "Example Supplier Co",
-   *   email: "sales@example.com",
-   *   address: { city: "SupplierCity", country: "China" },
-   *   currencyCode: "USD"
-   * });
-   */
   async upsertVendor(data: {
     id?: string;
     name: string;
@@ -1493,43 +2183,17 @@ export class InFlowMCPClient {
     isActive?: boolean;
     timestamp?: string;
   }): Promise<any> {
-    const result = await this.callTool("upsert_vendor", data);
-    cache.invalidatePattern(/^vendors/);
-    return result;
+    const { id, timestamp: _timestamp, ...rawValues } = data;
+    const values = compactDefined(rawValues) as Record<string, unknown>;
+    return this.previewThenApply(
+      "set_vendor",
+      { ...(id ? { vendorId: id } : {}), mode: id ? "patch" : "replace", values },
+      true,
+      [`vendor:${id ?? "new"}`],
+    );
   }
 
-  // ============================================
-  // PURCHASE ORDER WRITE OPERATIONS
-  // ============================================
 
-  /**
-   * Creates a new purchase order or updates an existing one.
-   *
-   * @param data - Purchase order data
-   * @param data.id - PO ID (for updates, omit for create)
-   * @param data.vendorId - Vendor ID (required)
-   * @param data.orderNumber - PO number (auto-generated if omitted)
-   * @param data.orderDate - Order date (ISO format)
-   * @param data.expectedDate - Expected delivery date
-   * @param data.locationId - Destination warehouse ID
-   * @param data.items - Array of line items (required)
-   * @param data.shippingAddress - Shipping address object
-   * @param data.currencyCode - Currency code
-   * @param data.remarks - Notes/remarks
-   * @param data.customFields - Custom field values
-   * @param data.timestamp - Required for updates (optimistic locking)
-   * @returns Created/updated purchase order object
-   *
-   * @invalidates purchase_orders, purchase_order:*
-   *
-   * @example
-   * await client.upsertPurchaseOrder({
-   *   vendorId: "vendor_123",
-   *   items: [{ productId: "prod_456", quantity: 100, unitCost: 72 }],
-   *   currencyCode: "USD",
-   *   remarks: "Supplier order #123"
-   * });
-   */
   async upsertPurchaseOrder(data: {
     id?: string;
     vendorId: string;
@@ -1560,27 +2224,66 @@ export class InFlowMCPClient {
     customFields?: Record<string, unknown>;
     timestamp?: string;
   }): Promise<any> {
-    const result = await this.callTool("upsert_purchase_order", data);
-    // Comprehensive cache invalidation (per Codex review)
-    cache.invalidatePattern(/^purchase_orders/);
-    cache.invalidatePattern(/^purchase_order:/);
-    return result;
+    const values = compactDefined({
+      orderNumber: data.orderNumber,
+      orderDate: data.orderDate,
+      expectedDate: data.expectedDate,
+      vendorId: data.vendorId,
+      locationId: data.locationId,
+      lines: data.items.map((item) => ({
+        purchaseOrderLineId: item.id,
+        productId: item.productId,
+        description: item.description,
+        quantity: {
+          standardQuantity: item.quantity,
+          uomQuantity: item.quantity,
+          serialNumbers: item.serialNumbers?.length ? item.serialNumbers : undefined,
+        },
+        unitPrice: item.unitCost,
+        taxCodeId: item.taxCodeId,
+        sublocation: item.sublocation,
+      })),
+      shippingAddress: data.shippingAddress,
+      currencyCode: data.currencyCode,
+      orderRemarks: data.remarks,
+      customFields: data.customFields,
+    }) as Record<string, unknown>;
+    return this.previewThenApply(
+      "set_purchase_order",
+      {
+        ...(data.id ? { purchaseOrderId: data.id } : {}),
+        mode: data.id ? "patch" : "replace",
+        values,
+      },
+      true,
+      [`purchase-order:${data.id ?? "new"}`, "inventory:stock"],
+    );
   }
 
-  /**
-   * Receive items on a purchase order (partial or full).
-   *
-   * Uses GET→modify→minimal PUT pattern. Supports receiving specific lines
-   * by purchaseOrderLineId or productId, or receiving all remaining with receiveAll.
-   *
-   * @param data.purchaseOrderId - PO ID (required)
-   * @param data.receiveAll - Receive all remaining qty on every line
-   * @param data.items - Specific lines to receive (mutually exclusive with receiveAll)
-   * @param data.allowOverReceive - Allow receiving more than ordered
-   * @returns Summary with per-line received quantities
-   *
-   * @invalidates purchase_orders, purchase_order:*, stock*
-   */
+  async updatePurchaseOrderHeaders(data: {
+    id: string;
+    vendorId: string;
+    timestamp: string;
+    remarks?: string;
+    orderDate?: string;
+    expectedDate?: string;
+    currencyCode?: string;
+  }): Promise<unknown> {
+    const values = compactDefined({
+      vendorId: data.vendorId,
+      orderRemarks: data.remarks,
+      orderDate: data.orderDate,
+      expectedDate: data.expectedDate,
+      currencyCode: data.currencyCode,
+    }) as Record<string, unknown>;
+    return this.previewThenApply(
+      "set_purchase_order",
+      { purchaseOrderId: data.id, mode: "patch", values },
+      true,
+      [`purchase-order:${data.id}`, "inventory:stock"],
+    );
+  }
+
   async receivePurchaseOrder(data: {
     purchaseOrderId: string;
     receiveAll?: boolean;
@@ -1592,33 +2295,37 @@ export class InFlowMCPClient {
     }>;
     allowOverReceive?: boolean;
   }): Promise<any> {
-    const result = await this.callTool("receive_purchase_order", data);
-    cache.invalidatePattern(/^purchase_orders/);
-    cache.invalidatePattern(/^purchase_order:/);
-    cache.invalidatePattern(/^stock/);
-    return result;
+    if (data.receiveAll || !data.items?.length) {
+      throw new Error(
+        "OPERATION_UNSUPPORTED: safe receipts require explicit items with productId and quantity; receiveAll is not supported",
+      );
+    }
+    if (data.items.some((item) => !item.productId)) {
+      throw new Error(
+        "OPERATION_UNSUPPORTED: safe receipts cannot resolve purchaseOrderLineId; supply productId explicitly",
+      );
+    }
+    if (data.allowOverReceive) {
+      throw new Error(
+        "OPERATION_UNSUPPORTED: safe receipts do not support allowOverReceive",
+      );
+    }
+    const receiveLines = data.items.map((item) => compactDefined({
+      productId: item.productId,
+      quantity: {
+        standardQuantity: item.quantity.toFixed(4),
+        uomQuantity: item.quantity.toFixed(4),
+        serialNumbers: item.serialNumbers?.length ? item.serialNumbers : undefined,
+      },
+    }) as Record<string, unknown>);
+    return this.previewThenApply(
+      "set_purchase_order_receipts",
+      { purchaseOrderId: data.purchaseOrderId, action: "receive", receiveLines },
+      true,
+      [`purchase-order:${data.purchaseOrderId}`, "inventory:stock"],
+    );
   }
 
-  /**
-   * Unreceive items from a purchase order (reverse stock).
-   *
-   * Removes receive line entries from the PO's receiveLines[] array via PUT,
-   * which reverses the stock that was added when the items were received.
-   *
-   * Supports three modes (mutually exclusive):
-   * - receiveLineIds: Remove specific receive lines by ID
-   * - items: Remove by product+quantity using LIFO (newest first)
-   * - unreceiveAll: Remove all receive lines
-   *
-   * @param data.purchaseOrderId - PO ID (required)
-   * @param data.receiveLineIds - Specific receive line IDs to remove
-   * @param data.items - Products to unreceive by quantity (LIFO)
-   * @param data.unreceiveAll - Remove ALL receive lines
-   * @param data.dryRun - Preview without making changes
-   * @returns Summary of removed/modified receive lines
-   *
-   * @invalidates purchase_orders, purchase_order:*, stock* (unless dryRun)
-   */
   async unreceivePurchaseOrder(data: {
     purchaseOrderId: string;
     receiveLineIds?: string[];
@@ -1626,21 +2333,25 @@ export class InFlowMCPClient {
     unreceiveAll?: boolean;
     dryRun?: boolean;
   }): Promise<any> {
-    const result = await this.callTool("unreceive_purchase_order", data);
-    if (!data.dryRun) {
-      cache.invalidatePattern(/^purchase_orders/);
-      cache.invalidatePattern(/^purchase_order:/);
-      cache.invalidatePattern(/^stock/);
+    if (data.unreceiveAll || data.items?.length || !data.receiveLineIds?.length) {
+      throw new Error(
+        "OPERATION_UNSUPPORTED: safe unreceive requires exact receiveLineIds; product-quantity LIFO and unreceiveAll are not supported",
+      );
     }
-    return result;
+    const receiveLines = data.receiveLineIds.map((purchaseOrderReceiveLineId) => ({
+      purchaseOrderReceiveLineId,
+    }));
+    return this.previewThenApply(
+      "set_purchase_order_receipts",
+      { purchaseOrderId: data.purchaseOrderId, action: "unreceive", receiveLines },
+      data.dryRun !== true,
+      [`purchase-order:${data.purchaseOrderId}`, "inventory:stock"],
+    );
   }
 
   /**
-   * Gets company information (not available via MCP).
-   *
-   * @throws {Error} Always throws - company ID is set via INFLOW_COMPANY_ID env var
-   * @deprecated Company info not available via MCP
-   */
+ * @deprecated
+ */
   async getCompanyInfo(): Promise<any> {
     throw new Error("Company info endpoint is not available via MCP. Company ID is set via INFLOW_COMPANY_ID environment variable.");
   }

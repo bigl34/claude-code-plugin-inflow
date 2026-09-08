@@ -1,5 +1,6 @@
 {
   "name": "inflow-inventory-manager",
-  "version": "1.9.1",
-  "description": "inFlow Inventory stock management and operations"
+  "version": "1.15.0",
+  "description": "inFlow Inventory stock management and operations",
+  "repository": "https://github.com/bigl34/claude-code-plugin-inflow"
 }
