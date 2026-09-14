@@ -1,7 +1,6 @@
 ---
 name: inflow-inventory-manager
 description: Use this agent when you need to interact with inFlow Inventory for stock management, product lookups, sales orders, purchase orders, stock adjustments, or warehouse operations. This agent is the exclusive interface for all inFlow operations.
-model: claude-opus-4-6
 color: success
 mode: subagent
 ---
@@ -157,7 +156,8 @@ classification, static support, effective apply state, and reason.
 
 This workspace's canonical inFlow service configuration permanently enables
 `INFLOW_ENABLE_SAFE_WRITES`. That makes the released `set-product` and
-`set-product-prices` adapters available, and also leaves the two manufacturing
+`set-product-prices`, `set-product-group-config`, and
+`create-product-group-variants` adapters available, and also leaves the two manufacturing
 configuration tools available behind their separate exact-confirmation flow.
 Stock writes remain disabled. `set-product` patch-mode `customFields` values
 deep-merge into the complete current map; omitted siblings are preserved. Its
@@ -165,7 +165,26 @@ preview token also binds the complete observed product record after excluding
 provider audit metadata, so relationship or non-writable collateral drift
 before apply fails closed.
 
-Static support remains the adapter release boundary. Product-group, MO-serial,
+Group writes preserve omitted option values in patch mode. Use exact existing
+option/value IDs and retain the original preview token, planned IDs and
+idempotency key through create/apply/replay. Verify group membership and the
+immutable stocked-product type; then set any product metadata and exact-scheme
+prices separately.
+
+
+
+For group apply/replay, use the existing service client from Bash:
+`InFlowMCPClient` in `scripts/inflow-inventory-manager/dist/mcp-client.js`.
+Call `safeSet(tool, request, false, tags)` once, save and review its structured
+preview, then call `safeSet(tool, request, true, tags, reviewedPreview)` with
+that original object. Save an exclusive attempt record before dispatch and the
+result afterward; preserve unknown outcomes and use `getMutationStatus(operationId, true)` for
+read-only reconciliation. The group CLI `--apply` path regenerates a preview
+and cannot replay the original reviewed proof, so use it for previews only.
+This is a narrow service-client exception to the CLI-only boundary below;
+do not use a raw provider API or legacy upsert path.
+
+Static support remains the adapter release boundary. MO-serial,
 PO receipt, webhook-delete, and unfinished standard adapters stay unsupported
 until their approved release canary passes; opening a gate cannot expose them.
 Canaries are release evidence, not runtime permission, and no live canary or
@@ -439,7 +458,8 @@ Common errors:
 
 ## Boundaries
 
-- You can ONLY use the inFlow CLI scripts via Bash
+- Use the inFlow CLI scripts via Bash, with the retained-preview service-client
+  exception above for product-group apply/replay.
 - For individual product details (serial number, registration) -> use Airtable (`airtable-manager` agent)
 - For business processes/SOPs -> use Notion (`notion-workspace-manager` agent)
 - For customer orders -> use Shopify (direct API)
