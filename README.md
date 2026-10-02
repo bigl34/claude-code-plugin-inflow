@@ -3,7 +3,7 @@
 
 inFlow Inventory stock management and operations
 
-![Version](https://img.shields.io/badge/version-1.15.1-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
+![Version](https://img.shields.io/badge/version-1.15.2-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
 
 ## Features
 
@@ -27,7 +27,7 @@ inFlow Inventory stock management and operations
 - **calculate-bom-requirements** — Direct/leaf/net material calculation
 - **set-product-group-config** — Exact-ID group configuration
 - **create-product-group-variants** — Compensated variant saga
-- **list-categories** — List all product categories
+- **list-categories** — List product categories (100 by default)
 
 ## Prerequisites
 
@@ -82,7 +82,7 @@ npm --prefix scripts run cli -- list-products
 | `calculate-bom-requirements`                  | Direct/leaf/net material calculation                                 | `--id --build-quantity --location-id --mode`                                                  |
 | `set-product-group-config`                    | Exact-ID group configuration                                         | `--id --mode --options --variants --apply`                                                    |
 | `create-product-group-variants`               | Compensated variant saga                                             | `--id --variants --apply`                                                                     |
-| `list-categories`                             | List all product categories                                          | (none)                                                                                        |
+| `list-categories`                             | List product categories (100 by default)                             | `--limit --skip`                                                                              |
 
 ## Usage Examples
 
@@ -90,8 +90,9 @@ npm --prefix scripts run cli -- list-products
 # List products
 npm --prefix "scripts" run cli -- list-products --limit 10
 
-# List all product categories
-npm --prefix "scripts" run cli -- list-categories
+# List product categories (100 per page; page with --skip until a page returns fewer than 100)
+npm --prefix "scripts" run cli -- list-categories --limit 100 --skip 0
+npm --prefix "scripts" run cli -- list-categories --limit 100 --skip 100
 
 # List products filtered by category name
 npm --prefix "scripts" run cli -- list-products --category "Parts" --limit 20

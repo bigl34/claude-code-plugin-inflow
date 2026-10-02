@@ -75,6 +75,7 @@ export interface CountedProductCatalogueProduct {
 export interface CountedProductCatalogueReport {
   generatedAt: string;
   complete: true;
+  completedCountWindow?: CompletedCountWindow;
   stableSnapshotAttempts: number;
   completedStockCountsScanned: number;
   countSheetsScanned: number;
@@ -107,7 +108,12 @@ export interface StockNoPhotoReport {
   productsWithoutPhoto: StockNoPhotoProduct[];
 }
 
-export interface StockNoPhotoOptions {
+export interface CompletedCountWindow {
+  since?: string;
+  before?: string;
+}
+
+export interface StockNoPhotoOptions extends CompletedCountWindow {
   apiKey: string;
   companyId: string;
   baseUrl?: string;
@@ -534,11 +540,36 @@ function addMembership(
 async function buildStableCountedProductSnapshot(
   options: StockNoPhotoOptions,
 ): Promise<StableCountedProductSnapshot> {
+  const parseBound = (value: string | undefined, label: string): number | undefined => {
+    if (value === undefined) return undefined;
+    const parsed = Date.parse(value);
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+      || !Number.isFinite(parsed)) {
+      throw new Error(`${label} must be an ISO timestamp with a timezone`);
+    }
+    return parsed;
+  };
+  const since = parseBound(options.since, "since");
+  const before = parseBound(options.before, "before");
+  if (since !== undefined && before !== undefined && since >= before) {
+    throw new Error("since must be earlier than before");
+  }
+  const selectHeaders = (headers: StockCountHeader[]): StockCountHeader[] => {
+    if (since === undefined && before === undefined) return headers;
+    return headers.filter((header) => {
+      const completedAt = Date.parse(header.completedDate);
+      if (!Number.isFinite(completedAt)) {
+        throw new Error(`stock count ${header.stockCountId}.completedDate is invalid`);
+      }
+      return (since === undefined || completedAt >= since)
+        && (before === undefined || completedAt < before);
+    });
+  };
   const client = new StockNoPhotoRestClient(options);
 
   for (let attempt = 1; attempt <= MAX_SNAPSHOT_ATTEMPTS; attempt += 1) {
     try {
-      const before = await client.listCompletedStockCounts();
+      const before = selectHeaders(await client.listCompletedStockCounts());
       const memberships = new Map<string, ProductMembership>();
       let countSheetsScanned = 0;
       let countLinesScanned = 0;
@@ -558,7 +589,7 @@ async function buildStableCountedProductSnapshot(
         throw new SnapshotChangedError("inFlow product/image state changed during the report");
       }
 
-      const after = await client.listCompletedStockCounts();
+      const after = selectHeaders(await client.listCompletedStockCounts());
       if (fingerprintHeaders(before) !== fingerprintHeaders(after)) {
         throw new SnapshotChangedError("inFlow completed stock counts changed during the report");
       }
@@ -611,6 +642,9 @@ export async function buildCountedProductCatalogueReport(
   return {
     generatedAt: snapshot.generatedAt,
     complete: true,
+    ...(options.since !== undefined || options.before !== undefined
+      ? { completedCountWindow: { since: options.since, before: options.before } }
+      : {}),
     stableSnapshotAttempts: snapshot.stableSnapshotAttempts,
     completedStockCountsScanned: snapshot.completedStockCountsScanned,
     countSheetsScanned: snapshot.countSheetsScanned,
@@ -678,6 +712,8 @@ export async function fetchStockNoPhotoReport(): Promise<StockNoPhotoReport> {
   return buildStockNoPhotoReport(loadCredentials());
 }
 
-export async function fetchCountedProductCatalogueReport(): Promise<CountedProductCatalogueReport> {
-  return buildCountedProductCatalogueReport(loadCredentials());
+export async function fetchCountedProductCatalogueReport(
+  window: CompletedCountWindow = {},
+): Promise<CountedProductCatalogueReport> {
+  return buildCountedProductCatalogueReport({ ...loadCredentials(), ...window });
 }

@@ -59,7 +59,7 @@ Run commands using: `npm --prefix "$CLAUDE_PLUGIN_ROOT/scripts" run cli -- <comm
 | `calculate-bom-requirements` | Direct/leaf/net material calculation | `--id --build-quantity --location-id --mode` |
 | `set-product-group-config` | Exact-ID group configuration | `--id --mode --options --variants --apply` |
 | `create-product-group-variants` | Compensated variant saga | `--id --variants --apply` |
-| `list-categories` | List all product categories | (none) |
+| `list-categories` | List product categories (100 by default) | `--limit --skip` |
 
 **Category Filtering**: Use `--category "Parts"` to filter by category name (case-insensitive) or `--category-id "uuid"` to filter by category ID.
 
@@ -73,9 +73,9 @@ invocation-derived inFlow create and associated label submission in its
 validated ordered batch. When the coordinator supplies the original
 invocation, batch position, exact final name, internal safe-set preview proof,
 and any duplicate decision, do not ask for routine per-product approval again.
-Without `--skip`, a conservatively identified likely duplicate still requires
+With `--check`, a conservatively identified likely duplicate still requires
 the coordinator to obtain and relay explicit `Create separate product anyway`
-approval for that affected item. With `--skip`, omit the duplicate catalogue
+approval for that affected item. Without `--check`, omit the duplicate catalogue
 read and duplicate approval. Continue to require a fresh preview, reusable
 preview token/idempotency key, exact confirmation hash, `--apply true`, and
 global `--confirm` for every individual create; these are machine-enforced
@@ -145,7 +145,11 @@ against current state immediately before apply and refuses missing, mismatched,
 or stale proof. Only
 `applied_verified` is confirmed success. For `applied_unverified`,
 `unknown_after_write`, or `partial_applied`, stop and run `mutation-status`;
-never repeat the mutation automatically.
+never repeat the mutation automatically. For an id-less create whose
+`mutation-status` reconciliation also fails, the only further step is the
+read-only exact-name catalogue reconciliation described in the create-product
+workflow (`.apm/prompts/create-product.prompt.md`); it can reuse one existing
+active exact match but never issues a second create.
 
 The safe path has two runtime controls. Every supported preview/apply operation
 requires `INFLOW_ENABLE_SAFE_WRITES=true`; stock-affecting operations also
@@ -198,12 +202,10 @@ Manufacturing pick-batch requires master + stock + its dedicated coordinator
 gate and final-build attestation. The retired price, product-group, MO-serial,
 standard, and broad manufacturing inputs do not authorize these writes.
 
-Deprecated immediate-write tools remain callable for compatibility and emit
-high-severity telemetry. They are a legacy bypass and are not controlled by
-`INFLOW_ENABLE_SAFE_WRITES`. An `OPERATION_UNSUPPORTED`,
-`UNSUPPORTED_WRITE_SEMANTICS`, confirmation, or gate error is an expected safe
-stop: never fall back automatically to a legacy tool, direct REST, or
-Playwright.
+The client has no legacy immediate-write helper; supported writes retain their
+preview/apply gates. An `OPERATION_UNSUPPORTED`, `UNSUPPORTED_WRITE_SEMANTICS`,
+confirmation, or gate error is an expected safe stop: never fall back
+automatically to a legacy tool, direct REST, or Playwright.
 
 **Example BOM response** (SafeOutput envelope):
 ```json
@@ -232,10 +234,18 @@ Playwright.
 | Command | Description | Options |
 |---------|-------------|---------|
 | `get-stock-levels` | Get current stock | `--product-id` (required) |
-| `list-stock-adjustments` | Adjustment history | `--limit` |
+| `list-stock-adjustments` | Adjustment history | `--limit --skip --sort --sort-desc` |
 | `get-stock-adjustment` | Get adjustment details | `--id` (required) |
 | `set-stock-adjustment` | Preview/apply an exact adjustment payload | `--values JSON [--apply --confirm --confirm-preview-hash HASH]` |
 | `list-adjustment-reasons` | List available reasons | (none) |
+
+`list-stock-adjustments` returns inFlow's default order, oldest first. A
+`--limit` above 100 is fetched as 100-record pages; page with `--limit 100
+--skip N` until a short page to reach recent adjustments. `--sort <property>`
+and `--sort-desc true` pass through to inFlow but have not been checked live.
+inFlow may reject an unknown sort or silently ignore it, so check that the
+first records' dates or adjustment numbers are in the order you asked for; if
+not, fall back to paging with `--skip`.
 
 **Available Adjustment Reasons**:
 - `Correction` - General inventory correction
@@ -318,16 +328,16 @@ migrate the workflow to a narrow exact-ID append adapter when one is released.
 | `list-serials` | List serial numbers from fulfilled orders | `--limit --product-id` |
 | `get-product-serials` | Get serial numbers for one product | `--id` (required) |
 | `list-all-serials` | Bounded read-only product-based serial number listing | `--max-products --in-stock-only --chunk --chunk-size` |
-| `export-all-vins` | Export product-based serial numbers to restricted JSON | `--output-file` (required), `--max-products --in-stock-only --overwrite` |
+| `export-all-serials` | Export product-based serial numbers to restricted JSON | `--output-file` (required), `--max-products --in-stock-only --overwrite` |
 | `search-serial-fast` | Search product serial inventory | `--query` (required) |
 | `build-serial-index` | Build serial index (expensive) | `--limit` |
 
-**Note**: serial numbers are extracted from `pickLines` and `packLines` in fulfilled orders. For comprehensive product data (registration status, customer info), also query Airtable via `airtable-manager`.
+**Note**: serial numbers are extracted from `pickLines` and `packLines` in fulfilled orders. For comprehensive product data (extended attributes, customer info), also query Airtable via `airtable-manager`.
 
 `list-all-serials` returns at most 100 rows on stdout by default. Check
 `metadata.scanTruncated`, `metadata.outputTruncated`, `metadata.hasMore`, and
 `metadata.nextChunk`; never describe a bounded scan as exhaustive. It never
-writes files. Use `export-all-vins --output-file <path>` for an atomically
+writes files. Use `export-all-serials --output-file <path>` for an atomically
 published mode-0600 JSON file containing the complete returned provider result.
 Export refuses an existing target by default. Replacing one requires both
 `--overwrite true` and global `--confirm`; never add those flags automatically.
@@ -335,8 +345,8 @@ Export refuses an existing target by default. Replacing one requires both
 #### Other Commands
 | Command | Description | Options |
 |---------|-------------|---------|
-| `list-customers` | List customers | `--limit` |
-| `list-vendors` | List vendors | `--limit` |
+| `list-customers` | List customers | `--limit --skip` |
+| `list-vendors` | List vendors | `--limit --skip` |
 
 ### Usage Examples
 
@@ -344,8 +354,9 @@ Export refuses an existing target by default. Replacing one requires both
 # List products
 npm --prefix "$CLAUDE_PLUGIN_ROOT/scripts" run cli -- list-products --limit 10
 
-# List all product categories
-npm --prefix "$CLAUDE_PLUGIN_ROOT/scripts" run cli -- list-categories
+# List product categories (100 per page; page with --skip until a page returns fewer than 100)
+npm --prefix "$CLAUDE_PLUGIN_ROOT/scripts" run cli -- list-categories --limit 100 --skip 0
+npm --prefix "$CLAUDE_PLUGIN_ROOT/scripts" run cli -- list-categories --limit 100 --skip 100
 
 # List products filtered by category name
 npm --prefix "$CLAUDE_PLUGIN_ROOT/scripts" run cli -- list-products --category "Parts" --limit 20
@@ -460,7 +471,7 @@ Common errors:
 
 - Use the inFlow CLI scripts via Bash, with the retained-preview service-client
   exception above for product-group apply/replay.
-- For individual product details (serial number, registration) -> use Airtable (`airtable-manager` agent)
+- For individual product details (serial number, associated records) -> use Airtable (`airtable-manager` agent)
 - For business processes/SOPs -> use Notion (`notion-workspace-manager` agent)
 - For customer orders -> use Shopify (direct API)
 

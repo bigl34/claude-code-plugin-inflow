@@ -15,22 +15,7 @@ const InFlowConfigSchema = z.object({
 
 type MCPConfig = z.infer<typeof InFlowConfigSchema>;
 
-const LEGACY_WRITE_REPLACEMENTS: Record<string, string> = {
-  upsert_product: "set_product",
-  upsert_sales_order: "set_sales_order",
-  upsert_purchase_order: "set_purchase_order",
-  receive_purchase_order: "set_purchase_order_receipts",
-  unreceive_purchase_order: "set_purchase_order_receipts",
-  upsert_customer: "set_customer",
-  upsert_vendor: "set_vendor",
-  upsert_stock_adjustment: "set_stock_adjustment",
-  upsert_stock_transfer: "set_stock_transfer",
-  upsert_stock_count: "set_stock_count",
-  upsert_manufacturing_order: "set_manufacturing_order",
-  upsert_taxing_scheme: "set_taxing_scheme",
-  upsert_webhook: "set_webhook",
-  delete_webhook: "remove_webhook",
-};
+const PRODUCT_PROVIDER_DROPPED_FIELDS = ["barcode", "cost", "reorderPoint", "reorderQuantity", "weightUnit"] as const;
 
 export interface ManufacturingComponentInput {
   itemBomId?: string;
@@ -237,6 +222,7 @@ interface CompleteProductScan {
 }
 
 const PRODUCT_PROVIDER_PAGE_SIZE = 100;
+const CATEGORY_DEFAULT_LIST_LIMIT = 100;
 const RECENT_PRODUCT_STABLE_SCANS_REQUIRED = 2;
 const RECENT_PRODUCT_MAX_SCAN_ATTEMPTS = 3;
 const RECENT_PRODUCT_MAX_PAGES_PER_SCAN = 10_000;
@@ -335,8 +321,8 @@ export class InFlowMCPClient {
     sleep?: (milliseconds: number) => Promise<void>;
   }) {
     this.injectedClient = opts?.client ?? null;
-    this.quarantine = new DirtyTagQuarantine(opts?.quarantinePath);
     this.now = opts?.now ?? Date.now;
+    this.quarantine = new DirtyTagQuarantine(opts?.quarantinePath, { now: this.now });
     this.sleep = opts?.sleep ?? ((milliseconds) => new Promise((resolve) => {
       setTimeout(resolve, milliseconds);
     }));
@@ -381,7 +367,7 @@ export class InFlowMCPClient {
 
   private invalidateTags(tags: string[]): void {
     for (const tag of tags) cache.invalidate(tag);
-    if (tags.some((tag) => tag.startsWith("product:") || tag.startsWith("prices:"))) {
+    if (tags.some((tag) => tag === "products:list" || tag.startsWith("product:") || tag.startsWith("prices:"))) {
       cache.invalidatePattern(/^products(?:\?|_|$)/);
       cache.invalidatePattern(/^product(?:\?|:|_|$)/);
     }
@@ -707,25 +693,6 @@ export class InFlowMCPClient {
 
     return content;
   }
-
-  async callLegacyWriteTool(
-    name: string,
-    args: Record<string, unknown>
-  ): Promise<unknown> {
-    console.error(JSON.stringify({
-      level: "warn",
-      severity: "high",
-      event: "inflow_legacy_write_tool",
-      tool: name,
-      safeWriteBypass: true,
-      masterGateApplies: false,
-      migrationRequired: true,
-      replacement: LEGACY_WRITE_REPLACEMENTS[name] ?? "no_safe_replacement_registered",
-      message: "LEGACY WRITE BYPASS: this immediate write is not controlled by INFLOW_ENABLE_SAFE_WRITES; migrate to the preview-first replacement before the 2.0 removal window.",
-    }));
-    return this.callTool(name, args);
-  }
-
 
   async listProducts(options?: {
     limit?: number;
@@ -1452,10 +1419,17 @@ export class InFlowMCPClient {
   }
 
 
-  async listCategories(): Promise<any> {
+  async listCategories(options?: { limit?: number; skip?: number }): Promise<any> {
+    const requestedLimit = options?.limit ?? CATEGORY_DEFAULT_LIST_LIMIT;
+    const startSkip = options?.skip ?? 0;
+    const cacheKey = createCacheKey("categories", {
+      limit: requestedLimit,
+      skip: startSkip,
+    });
+
     return cache.getOrFetch(
-      "categories",
-      () => this.callTool("list_categories", { count: 100 }),
+      cacheKey,
+      () => this.callListToolPaged("list_categories", {}, requestedLimit, startSkip),
       { ttl: TTL.HOUR, bypassCache: this.cacheDisabled }
     );
   }
@@ -1493,15 +1467,27 @@ export class InFlowMCPClient {
   }
 
 
-  async listStockAdjustments(options?: { limit?: number }): Promise<any> {
-    const cacheKey = createCacheKey("stock_adjustments", { limit: options?.limit });
+  async listStockAdjustments(options?: {
+    limit?: number;
+    skip?: number;
+    sort?: string;
+    sortDesc?: boolean;
+  }): Promise<any> {
+    const startSkip = options?.skip ?? 0;
+    const cacheKey = createCacheKey("stock_adjustments", {
+      limit: options?.limit,
+      skip: startSkip,
+      sort: options?.sort,
+      sortDesc: options?.sortDesc,
+    });
 
     return cache.getOrFetch(
       cacheKey,
       async () => {
-        const args: Record<string, any> = {};
-        if (options?.limit) args.limit = options.limit;
-        return this.callTool("list_stock_adjustments", args);
+        const args: Record<string, unknown> = {};
+        if (options?.sort) args.sort = options.sort;
+        if (options?.sortDesc !== undefined) args.sortDesc = options.sortDesc;
+        return this.callListToolPaged("list_stock_adjustments", args, options?.limit, startSkip);
       },
       { ttl: TTL.FIVE_MINUTES, bypassCache: this.cacheDisabled }
     );
@@ -2089,30 +2075,30 @@ export class InFlowMCPClient {
   }
 
 
-  async listCustomers(options?: { limit?: number }): Promise<any> {
-    const cacheKey = createCacheKey("customers", { limit: options?.limit });
+  async listCustomers(options?: { limit?: number; skip?: number }): Promise<any> {
+    const startSkip = options?.skip ?? 0;
+    const cacheKey = createCacheKey("customers", {
+      limit: options?.limit,
+      skip: startSkip,
+    });
 
     return cache.getOrFetch(
       cacheKey,
-      async () => {
-        const args: Record<string, any> = {};
-        if (options?.limit) args.limit = options.limit;
-        return this.callTool("list_customers", args);
-      },
+      () => this.callListToolPaged("list_customers", {}, options?.limit, startSkip),
       { ttl: TTL.FIFTEEN_MINUTES, bypassCache: this.cacheDisabled }
     );
   }
 
-  async listVendors(options?: { limit?: number }): Promise<any> {
-    const cacheKey = createCacheKey("vendors", { limit: options?.limit });
+  async listVendors(options?: { limit?: number; skip?: number }): Promise<any> {
+    const startSkip = options?.skip ?? 0;
+    const cacheKey = createCacheKey("vendors", {
+      limit: options?.limit,
+      skip: startSkip,
+    });
 
     return cache.getOrFetch(
       cacheKey,
-      async () => {
-        const args: Record<string, any> = {};
-        if (options?.limit) args.limit = options.limit;
-        return this.callTool("list_vendors", args);
-      },
+      () => this.callListToolPaged("list_vendors", {}, options?.limit, startSkip),
       { ttl: TTL.FIFTEEN_MINUTES, bypassCache: this.cacheDisabled }
     );
   }
@@ -2124,14 +2110,9 @@ export class InFlowMCPClient {
     sku?: string;
     description?: string;
     categoryId?: string;
-    cost?: number;
     defaultPrice?: number;
     prices?: unknown[];
-    barcode?: string;
-    reorderPoint?: number;
-    reorderQuantity?: number;
     weight?: number;
-    weightUnit?: string;
     isActive?: boolean;
     customFields?: Record<string, unknown>;
     timestamp?: string;
@@ -2139,6 +2120,13 @@ export class InFlowMCPClient {
     if (data.defaultPrice !== undefined || data.prices !== undefined) {
       throw new Error(
         "OPERATION_UNSUPPORTED: price fields cannot be mixed into set_product; use setProductPrices explicitly",
+      );
+    }
+    const providerDropped = PRODUCT_PROVIDER_DROPPED_FIELDS.filter((field) => (data as Record<string, unknown>)[field] !== undefined);
+    if (providerDropped.length > 0) {
+      throw new Error(
+        `OPERATION_UNSUPPORTED: set_product cannot set ${providerDropped.join(",")}; the inFlow product PUT ignores them ` +
+          "(barcodes are productBarcodes[] rows, reorder thresholds are reorderSettings[] rows, cost is the read-only ProductCost relation, weightUnit is a company setting)",
       );
     }
     const { id, timestamp: _timestamp, defaultPrice: _defaultPrice, prices: _prices, ...rawValues } = data;

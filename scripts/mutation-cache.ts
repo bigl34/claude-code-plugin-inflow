@@ -1,6 +1,17 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir, hostname } from "node:os";
+import { TTL } from "@local/plugin-cache";
+
+export const DEFAULT_DIRTY_QUARANTINE_MAX_AGE_MS = TTL.HOUR;
+const DEFAULT_LOCK_WAIT_MS = 5_000;
+const LOCK_POLL_INTERVAL_MS = 25;
+
+export interface DirtyTagQuarantineOptions {
+  maxAgeMs?: number;
+  now?: () => number;
+  lockWaitMs?: number;
+}
 
 interface DirtyOperation {
   operationId: string;
@@ -17,6 +28,18 @@ interface LockOwner {
   pendingOperations: DirtyOperation[];
 }
 
+type LockOwnerRead =
+  | { status: "in_flight" }
+  | { status: "invalid" }
+  | { status: "valid"; owner: LockOwner };
+
+function parseLockOwner(raw: string): LockOwner | undefined {
+  const parsed = JSON.parse(raw) as Partial<LockOwner>;
+  if (parsed.schemaVersion !== "inflow-dirty-cache-lock/v1" || !Number.isInteger(parsed.pid) || typeof parsed.hostname !== "string" || typeof parsed.createdAt !== "string" || !Array.isArray(parsed.pendingOperations)) return undefined;
+  parseOperations(JSON.stringify({ schemaVersion: "inflow-dirty-cache/v1", operations: parsed.pendingOperations }));
+  return parsed as LockOwner;
+}
+
 function parseOperations(raw: string): DirtyOperation[] {
   const parsed = JSON.parse(raw) as { schemaVersion?: unknown; operations?: unknown };
   if (parsed.schemaVersion !== "inflow-dirty-cache/v1" || !Array.isArray(parsed.operations)) {
@@ -28,6 +51,8 @@ function parseOperations(raw: string): DirtyOperation[] {
     if (typeof row.operationId !== "string" || !Array.isArray(row.tags) || !row.tags.every((tag) => typeof tag === "string") || typeof row.state !== "string" || typeof row.recordedAt !== "string") {
       throw new Error("INVALID_DIRTY_QUARANTINE_ROW");
     }
+    const recordedAtMs = Date.parse(row.recordedAt);
+    if (Number.isNaN(recordedAtMs)) throw new Error("INVALID_DIRTY_QUARANTINE_ROW");
   }
   return parsed.operations as DirtyOperation[];
 }
@@ -41,24 +66,54 @@ export class DirtyTagQuarantine {
   private operations = new Map<string, DirtyOperation>();
   private corruptState = false;
   private clearedOperationIds = new Set<string>();
+  private readonly maxAgeMs: number;
+  private readonly now: () => number;
+  private readonly lockWaitMs: number;
 
-  constructor(private readonly path = defaultPath()) {
+  constructor(private readonly path = defaultPath(), options: DirtyTagQuarantineOptions = {}) {
+    this.maxAgeMs = options.maxAgeMs ?? DEFAULT_DIRTY_QUARANTINE_MAX_AGE_MS;
+    this.now = options.now ?? Date.now;
+    this.lockWaitMs = options.lockWaitMs ?? DEFAULT_LOCK_WAIT_MS;
+    const pendingOwner = this.awaitLockOwner();
+    this.loadLedger();
+    if (pendingOwner) this.overlayPendingOperations(pendingOwner.pendingOperations);
+    this.pruneExpired();
+  }
+
+  private loadLedger(): void {
     try {
-      for (const operation of parseOperations(readFileSync(path, "utf8"))) this.operations.set(operation.operationId, operation);
+      for (const operation of parseOperations(readFileSync(this.path, "utf8"))) this.operations.set(operation.operationId, operation);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.corruptState = true;
     }
-    this.loadPendingLockState();
+  }
+
+  private overlayPendingOperations(pendingOperations: DirtyOperation[]): void {
+    for (const operation of pendingOperations) this.operations.set(operation.operationId, operation);
+  }
+
+  private get lockPath(): string {
+    return `${this.path}.lock`;
+  }
+
+  private lockHeld(): boolean {
+    return existsSync(this.lockPath);
   }
 
   hasAny(tags: string[]): boolean {
-    return this.corruptState || existsSync(`${this.path}.lock`) || [...this.operations.values()].some((operation) => operation.tags.some((dirty) => tags.some((tag) => dirty === tag || dirty.startsWith(`${tag}:`) || tag.startsWith(`${dirty}:`))));
+    this.pruneExpired();
+    return this.corruptState || this.lockHeld() || [...this.operations.values()].some((operation) => operation.tags.some((dirty) => tags.some((tag) => dirty === tag || dirty.startsWith(`${tag}:`) || tag.startsWith(`${dirty}:`))));
   }
 
-  hasDirtyState(): boolean { return this.corruptState || existsSync(`${this.path}.lock`) || this.operations.size > 0; }
+  hasDirtyState(): boolean {
+    this.pruneExpired();
+    return this.corruptState || this.lockHeld() || this.operations.size > 0;
+  }
 
   record(operationId: string, tags: string[], state: string): void {
-    this.operations.set(operationId, { operationId, tags: [...new Set(tags)].sort(), state, recordedAt: new Date().toISOString() });
+    const recordedAt = new Date(this.now()).toISOString();
+    const uniqueSortedTags = [...new Set(tags)].sort();
+    this.operations.set(operationId, { operationId, tags: uniqueSortedTags, state, recordedAt });
     this.clearedOperationIds.delete(operationId);
     this.persist();
   }
@@ -69,28 +124,73 @@ export class DirtyTagQuarantine {
     this.persist();
   }
 
-  list(): DirtyOperation[] { return [...this.operations.values()].sort((a, b) => a.recordedAt.localeCompare(b.recordedAt)); }
+  list(): DirtyOperation[] {
+    this.pruneExpired();
+    return this.sortedOperations();
+  }
 
-  private readLockOwner(lockPath: string): LockOwner | undefined {
+  private sortedOperations(): DirtyOperation[] {
+    return [...this.operations.values()].sort((a, b) => a.recordedAt.localeCompare(b.recordedAt));
+  }
+
+  private isExpired(operation: DirtyOperation): boolean {
+    const ageMs = this.now() - Date.parse(operation.recordedAt);
+    return ageMs > this.maxAgeMs;
+  }
+
+  private dropExpired(): boolean {
+    const expired = [...this.operations.values()].filter((operation) => this.isExpired(operation));
+    for (const operation of expired) this.operations.delete(operation.operationId);
+    return expired.length > 0;
+  }
+
+  private pruneExpired(): void {
+    const dropped = this.dropExpired();
+    if (!dropped) return;
+    if (this.lockHeld()) return;
     try {
-      const parsed = JSON.parse(readFileSync(join(lockPath, "owner.json"), "utf8")) as Partial<LockOwner>;
-      if (parsed.schemaVersion !== "inflow-dirty-cache-lock/v1" || !Number.isInteger(parsed.pid) || typeof parsed.hostname !== "string" || typeof parsed.createdAt !== "string" || !Array.isArray(parsed.pendingOperations)) return undefined;
-      parseOperations(JSON.stringify({ schemaVersion: "inflow-dirty-cache/v1", operations: parsed.pendingOperations }));
-      return parsed as LockOwner;
+      this.persist();
     } catch {
-      return undefined;
+      return;
     }
   }
 
-  private loadPendingLockState(): void {
-    const lockPath = `${this.path}.lock`;
-    if (!existsSync(lockPath)) return;
-    const owner = this.readLockOwner(lockPath);
-    if (!owner) {
-      this.corruptState = true;
-      return;
+  private readLockOwner(lockPath: string): LockOwnerRead {
+    let raw: string;
+    try {
+      raw = readFileSync(join(lockPath, "owner.json"), "utf8");
+    } catch (error) {
+      const missing = (error as NodeJS.ErrnoException).code === "ENOENT";
+      return missing ? { status: "in_flight" } : { status: "invalid" };
     }
-    for (const operation of owner.pendingOperations) this.operations.set(operation.operationId, operation);
+    const stillEmpty = raw.length === 0;
+    if (stillEmpty) return { status: "in_flight" };
+    try {
+      const owner = parseLockOwner(raw);
+      return owner ? { status: "valid", owner } : { status: "invalid" };
+    } catch {
+      return { status: "invalid" };
+    }
+  }
+
+  private awaitLockOwner(): LockOwner | undefined {
+    const waitCell = new Int32Array(new SharedArrayBuffer(4));
+    const started = Date.now();
+    while (this.lockHeld()) {
+      const ownerRead = this.readLockOwner(this.lockPath);
+      if (ownerRead.status === "valid") return ownerRead.owner;
+      if (ownerRead.status === "invalid") {
+        this.corruptState = true;
+        return undefined;
+      }
+      const waitedMs = Date.now() - started;
+      if (waitedMs > this.lockWaitMs) {
+        this.corruptState = true;
+        return undefined;
+      }
+      Atomics.wait(waitCell, 0, 0, LOCK_POLL_INTERVAL_MS);
+    }
+    return undefined;
   }
 
   private ownerIsDead(owner: LockOwner): boolean {
@@ -106,7 +206,7 @@ export class DirtyTagQuarantine {
   private persist(): void {
     if (this.corruptState) return;
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
-    const lockPath = `${this.path}.lock`;
+    const lockPath = this.lockPath;
     const waitCell = new Int32Array(new SharedArrayBuffer(4));
     const started = Date.now();
     while (true) {
@@ -117,22 +217,26 @@ export class DirtyTagQuarantine {
           pid: process.pid,
           hostname: hostname(),
           createdAt: new Date().toISOString(),
-          pendingOperations: this.list(),
+          pendingOperations: this.sortedOperations(),
         };
-        writeFileSync(join(lockPath, "owner.json"), `${JSON.stringify(owner)}\n`, { mode: 0o600 });
+        const ownerPath = join(lockPath, "owner.json");
+        const ownerTempPath = join(lockPath, "owner.json.tmp");
+        writeFileSync(ownerTempPath, `${JSON.stringify(owner)}\n`, { mode: 0o600 });
+        renameSync(ownerTempPath, ownerPath);
         break;
       }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        const owner = this.readLockOwner(lockPath);
-        if (owner && this.ownerIsDead(owner)) {
-          for (const operation of owner.pendingOperations) this.operations.set(operation.operationId, operation);
+        const ownerRead = this.readLockOwner(lockPath);
+        if (ownerRead.status === "valid" && this.ownerIsDead(ownerRead.owner)) {
+          this.overlayPendingOperations(ownerRead.owner.pendingOperations);
           rmSync(lockPath, { recursive: true, force: true });
           continue;
         }
-        if (!owner) this.corruptState = true;
-        if (Date.now() - started > 5_000) throw new Error("DIRTY_QUARANTINE_LOCK_TIMEOUT");
-        Atomics.wait(waitCell, 0, 0, 25);
+        if (ownerRead.status === "invalid") this.corruptState = true;
+        const waitedMs = Date.now() - started;
+        if (waitedMs > this.lockWaitMs) throw new Error("DIRTY_QUARANTINE_LOCK_TIMEOUT");
+        Atomics.wait(waitCell, 0, 0, LOCK_POLL_INTERVAL_MS);
       }
     }
     try {
@@ -144,6 +248,9 @@ export class DirtyTagQuarantine {
       }
       for (const id of this.clearedOperationIds) merged.delete(id);
       for (const operation of this.operations.values()) merged.set(operation.operationId, operation);
+      for (const operation of [...merged.values()]) {
+        if (this.isExpired(operation)) merged.delete(operation.operationId);
+      }
       const rows = [...merged.values()].sort((a, b) => a.recordedAt.localeCompare(b.recordedAt));
       const temp = `${this.path}.${process.pid}.tmp`;
       writeFileSync(temp, `${JSON.stringify({ schemaVersion: "inflow-dirty-cache/v1", operations: rows }, null, 2)}\n`, { mode: 0o600 });

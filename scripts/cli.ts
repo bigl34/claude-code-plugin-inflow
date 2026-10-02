@@ -19,8 +19,11 @@ import {
 import { readReorderThresholds } from "./reorder-settings.js";
 import {
   fetchStockNoPhotoReport,
+  fetchCountedProductCatalogueReport,
   type StockNoPhotoReport,
+  type CountedProductCatalogueReport,
 } from "./stock-no-photo.js";
+/*  */
 import { pathToFileURL } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -300,6 +303,26 @@ function wrapSalesOrderContent(order: AnyRecord, pathPrefix: string) {
           ...wrapCustomer(customer, `${pathPrefix}.customer`),
         }
       : undefined,
+    contactName: wrapUntrustedField(
+      `${pathPrefix}.contactName`,
+      order.contactName ?? "",
+      { maxChars: TRUNCATION_DEFAULTS.displayName }
+    ),
+    email: wrapUntrustedField(
+      `${pathPrefix}.email`,
+      order.email ?? "",
+      { maxChars: TRUNCATION_DEFAULTS.displayName }
+    ),
+    phone: wrapUntrustedField(
+      `${pathPrefix}.phone`,
+      order.phone ?? "",
+      { maxChars: TRUNCATION_DEFAULTS.displayName }
+    ),
+    poNumber: wrapUntrustedField(
+      `${pathPrefix}.poNumber`,
+      order.poNumber ?? "",
+      { maxChars: TRUNCATION_DEFAULTS.displayName }
+    ),
     billingAddress: wrapAddress(billingAddress, `${pathPrefix}.billingAddress`),
     shippingAddress: wrapAddress(shippingAddress, `${pathPrefix}.shippingAddress`),
     lines: wrapOrderLines(lines, `${pathPrefix}.lines`),
@@ -343,6 +366,10 @@ function salesOrderMetadata(order: AnyRecord) {
     locationId: order.locationId,
     status: order.status,
     inventoryStatus: order.inventoryStatus,
+    paymentStatus: order.paymentStatus,
+    isCancelled: order.isCancelled,
+    isCompleted: order.isCompleted,
+    shippedDate: order.shippedDate,
     currencyCode: order.currencyCode,
     exchangeRate: order.exchangeRate,
     subtotal: order.subtotal,
@@ -369,6 +396,16 @@ function wrapPurchaseOrderContent(order: AnyRecord, pathPrefix: string) {
           ...wrapVendor(vendor, `${pathPrefix}.vendor`),
         }
       : undefined,
+    vendorOrderNumber: wrapUntrustedField(
+      `${pathPrefix}.vendorOrderNumber`,
+      order.vendorOrderNumber ?? "",
+      { maxChars: TRUNCATION_DEFAULTS.displayName }
+    ),
+    carrier: wrapUntrustedField(
+      `${pathPrefix}.carrier`,
+      order.carrier ?? "",
+      { maxChars: TRUNCATION_DEFAULTS.displayName }
+    ),
     shippingAddress: wrapAddress(shippingAddress, `${pathPrefix}.shippingAddress`),
     lines: wrapOrderLines(lines, `${pathPrefix}.lines`),
     orderRemarks: wrapUntrustedField(
@@ -394,16 +431,21 @@ function purchaseOrderMetadata(order: AnyRecord) {
     purchaseOrderId: order.purchaseOrderId,
     orderNumber: order.orderNumber,
     orderDate: order.orderDate,
-    expectedDate: order.expectedDate,
+    requestShipDate: order.requestShipDate,
     vendorId: order.vendorId,
     locationId: order.locationId,
     status: order.status,
     inventoryStatus: order.inventoryStatus,
+    paymentStatus: order.paymentStatus,
+    isCancelled: order.isCancelled,
+    isCompleted: order.isCompleted,
     currencyCode: order.currencyCode,
     exchangeRate: order.exchangeRate,
     subtotal: order.subtotal,
     taxTotal: order.taxTotal,
     total: order.total,
+    amountPaid: order.amountPaid,
+    balance: order.balance,
     timestamp: order.timestamp,
     createdDate: order.createdDate,
     modifiedDate: order.lastModifiedDateTime ?? order.modifiedDate,
@@ -671,7 +713,7 @@ function writeRestrictedJson(
   return outputPath;
 }
 
-type AllVinScan = {
+type AllSerialScan = {
   serials: unknown[];
   totalSerials: number;
   productsFetched: number;
@@ -680,10 +722,10 @@ type AllVinScan = {
   providerHasMore: boolean;
 };
 
-async function fetchAllVins(
+async function fetchAllSerials(
   client: InFlowMCPClient,
   options: { maxProducts?: number; inStockOnly?: boolean }
-): Promise<AllVinScan> {
+): Promise<AllSerialScan> {
   const result = await client.listAllSerials(options);
   const resultRecord = asRecord(result);
   const rawSerials = Array.isArray(resultRecord.serials)
@@ -1043,7 +1085,7 @@ const SHA256_HEX = /^[a-f0-9]{64}$/;
 
 const GENERIC_SAFE_SET_ENTITIES: Record<
   string,
-  { idField: string; resourceType: string }
+  { idField: string; resourceType: string; providesTimestamp?: false }
 > = {
   set_product: { idField: "productId", resourceType: "product" },
   set_sales_order: { idField: "salesOrderId", resourceType: "sales-order" },
@@ -1074,7 +1116,7 @@ const GENERIC_SAFE_SET_ENTITIES: Record<
     idField: "taxingSchemeId",
     resourceType: "taxing-scheme",
   },
-  set_webhook: { idField: "webhookId", resourceType: "webhook" },
+  set_webhook: { idField: "webhookId", resourceType: "webhook", providesTimestamp: false },
   remove_webhook: { idField: "webhookId", resourceType: "webhook" },
 };
 
@@ -1196,14 +1238,16 @@ function genericSafeSetReviewProof(
       reason: "id-less create preview did not return a reusable preview token and idempotency key",
     };
   }
+  const timestampIsProven = entity.providesTimestamp === false
+    ? preview.entityTimestamp == null
+    : typeof preview.entityTimestamp === "string" && preview.entityTimestamp.length > 0;
   const sourceRevisionIsComplete = isCreate
     ? preview.currentSemanticHash == null
       && preview.currentWriteShapeHash == null
       && preview.entityTimestamp == null
     : SHA256_HEX.test(String(preview.currentSemanticHash ?? ""))
       && SHA256_HEX.test(String(preview.currentWriteShapeHash ?? ""))
-      && typeof preview.entityTimestamp === "string"
-      && preview.entityTimestamp.length > 0;
+      && timestampIsProven;
   if (!sourceRevisionIsComplete || !SHA256_HEX.test(String(preview.desiredHash ?? ""))) {
     return {
       applyEnabled: false,
@@ -1523,7 +1567,25 @@ export function buildStockNoPhotoSafeOutput(report: StockNoPhotoReport) {
   );
 }
 
-export const commands = {
+export function buildCountedProductsSafeOutput(report: CountedProductCatalogueReport, countedOnly = true) {
+  const products = countedOnly ? report.products.filter((product) => product.hasCompletedStockCount) : report.products;
+  return buildSafeOutput(
+    { command: "list-counted-products", generatedAt: report.generatedAt, complete: report.complete,
+      ...(report.completedCountWindow ? { completedCountWindow: report.completedCountWindow } : {}),
+      uniqueCountedProducts: report.uniqueCountedProducts, count: products.length,
+      completedStockCountsScanned: report.completedStockCountsScanned },
+    { products: products.map((product, index) => ({
+      productId: product.productId, isActive: product.isActive,
+      hasCompletedStockCount: product.hasCompletedStockCount,
+      stockCountOccurrences: product.stockCountOccurrences,
+      lastCountDate: product.lastCountDate,
+      sku: wrapUntrustedField(`products[${index}].sku`, product.sku, { maxChars: 1000 }),
+      name: wrapUntrustedField(`products[${index}].name`, product.name, { maxChars: 1000 }),
+    })) },
+  );
+}
+
+const commandDefinitions = {
   "list-tools": createCommand(
     z.object({}),
     async (_args, client: InFlowMCPClient) => {
@@ -1796,6 +1858,9 @@ export const commands = {
           isActive: record.isActive,
           isSerialized: record.isSerialized,
           trackSerials: record.trackSerials,
+          autoAssemble: record.autoAssemble,
+          includeQuantityBuildable: record.includeQuantityBuildable,
+          hasBom: record.bom != null || record.billOfMaterials != null,
           ...readWrappedReorderThresholds(record, "product"),
           createdDate: record.createdDttm,
           modifiedDate: record.lastModifiedDateTime,
@@ -2406,9 +2471,13 @@ export const commands = {
   ),
 
   "list-categories": createCommand(
-    z.object({}),
-    async (_args, client: InFlowMCPClient) => {
-      const raw = await client.listCategories();
+    z.object({
+      limit: cliTypes.int(1, 250).optional().describe("Max records (default 100; above 100 is fetched as 100-record provider pages)"),
+      skip: cliTypes.int(0).optional().describe("Records to skip"),
+    }),
+    async (args, client: InFlowMCPClient) => {
+      const { limit, skip } = args as { limit?: number; skip?: number };
+      const raw = await client.listCategories({ limit, skip });
 
       const rawCategories = (raw?.data ?? raw ?? []) as unknown[];
       const wrappedCategories = (Array.isArray(rawCategories) ? rawCategories : [rawCategories]).map(
@@ -2431,7 +2500,7 @@ export const commands = {
         { categories: wrappedCategories }
       );
     },
-    "List all product categories",
+    "List product categories (100 by default; page with --skip)",
     { sideEffect: "read" }
   ),
 
@@ -2502,10 +2571,21 @@ export const commands = {
   ),
 
   "list-stock-adjustments": createCommand(
-    z.object({ limit: cliTypes.int(1, 250).optional().describe("Max records") }),
+    z.object({
+      limit: cliTypes.int(1, 250).optional().describe("Max records (above 100 is fetched as 100-record provider pages)"),
+      skip: cliTypes.int(0).optional().describe("Records to skip"),
+      sort: z
+        .string()
+        .regex(/^[A-Za-z][A-Za-z0-9]*$/, "sort must be a plain inFlow property name")
+        .optional()
+        .describe("Stock adjustment property to sort by (default: inFlow's order, oldest first)"),
+      sortDesc: cliTypes.bool().optional().describe("Sort in descending order"),
+    }),
     async (args, client: InFlowMCPClient) => {
-      const { limit } = args as { limit?: number };
-      return client.listStockAdjustments({ limit });
+      const { limit, skip, sort, sortDesc } = args as {
+        limit?: number; skip?: number; sort?: string; sortDesc?: boolean;
+      };
+      return client.listStockAdjustments({ limit, skip, sort, sortDesc });
     },
     "List stock adjustment history",
     { sideEffect: "read" }
@@ -2671,6 +2751,20 @@ export const commands = {
     "List products that appeared on a completed stock-count sheet but currently have no inFlow photo",
     { sideEffect: "read" }
   ),
+
+  "list-counted-products": createCommand(
+    z.object({ countedOnly: cliTypes.bool().optional(), since: z.string().optional(), before: z.string().optional() }),
+    async (args) => {
+      const input = args as { countedOnly?: boolean; since?: string; before?: string };
+      return buildCountedProductsSafeOutput(await fetchCountedProductCatalogueReport({
+        since: input.since, before: input.before,
+      }), input.countedOnly !== false);
+    },
+    "List products on completed physical stock counts",
+    { sideEffect: "read" }
+  ),
+
+  /*  */
 
   "create-stock-count": createCommand(
     z.object({
@@ -2865,28 +2959,26 @@ export const commands = {
       sku: z.string().optional().describe("Product SKU"),
       description: z.string().optional().describe("Product description"),
       categoryId: z.string().optional().describe("Category ID"),
-      cost: z.coerce.number().optional().describe("Unit cost"),
       price: z.string().regex(/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/).optional().describe("Exact selling-price decimal"),
       pricingSchemeId: z.string().optional().describe("Exact pricing scheme ID required with --price"),
       apply: cliTypes.bool().optional().describe("Apply the fresh preview"),
       confirmPreviewHash: genericSafeSetConfirmationHashSchema,
       ...idlessCreateConfirmationFields,
-      barcode: z.string().optional().describe("Product barcode"),
     }),
     async (args, client: InFlowMCPClient, globals) => {
       const {
-        name, sku, description, categoryId, cost, price, barcode, apply,
+        name, sku, description, categoryId, price, apply,
         confirmPreviewHash, confirmPreviewToken, confirmIdempotencyKey,
       } = args as {
         name: string; sku?: string; description?: string; categoryId?: string;
-        cost?: number; price?: string; barcode?: string; apply?: boolean;
+        price?: string; apply?: boolean;
         confirmPreviewHash?: string; confirmPreviewToken?: string; confirmIdempotencyKey?: string;
       };
       if (price !== undefined) throw new Error("Create the product first, then use set-product-prices with an exact pricingSchemeId");
       return runConfirmedSafeSet({
         command: "create-product",
         tool: "set_product",
-        request: { mode: "replace", values: { name, sku, description, categoryId, cost, barcode } },
+        request: { mode: "replace", values: { name, sku, description, categoryId } },
         apply: apply === true,
         confirmPreviewHash,
         confirmPreviewToken,
@@ -2906,26 +2998,25 @@ export const commands = {
       name: z.string().optional().describe("Product name"),
       sku: z.string().optional().describe("Product SKU"),
       description: z.string().optional().describe("Product description"),
-      cost: z.coerce.number().optional().describe("Unit cost"),
       price: z.string().regex(/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/).optional().describe("Exact selling-price decimal"),
       pricingSchemeId: z.string().optional().describe("Exact pricing scheme ID required with --price"),
       apply: cliTypes.bool().optional().describe("Apply the fresh preview"),
       confirmPreviewHash: genericSafeSetConfirmationHashSchema,
     }),
     async (args, client: InFlowMCPClient, globals) => {
-      const { id, name, sku, description, cost, price, pricingSchemeId, apply, confirmPreviewHash } = args as {
+      const { id, name, sku, description, price, pricingSchemeId, apply, confirmPreviewHash } = args as {
         id: string; name?: string; sku?: string; description?: string;
-        cost?: number; price?: string; pricingSchemeId?: string; apply?: boolean; confirmPreviewHash?: string;
+        price?: string; pricingSchemeId?: string; apply?: boolean; confirmPreviewHash?: string;
       };
       if (price !== undefined) {
         if (!pricingSchemeId) throw new Error("--pricingSchemeId is required with --price; price names are never write selectors");
-        if (name !== undefined || sku !== undefined || description !== undefined || cost !== undefined) throw new Error("Price and product-field changes must be previewed as separate operations");
+        if (name !== undefined || sku !== undefined || description !== undefined) throw new Error("Price and product-field changes must be previewed as separate operations");
         return buildOperationalSafeOutput("update-product", await client.setProductPrices({ productId: id, mode: "patch", prices: [{ pricingSchemeId, unitPrice: price }] }, apply === true));
       }
       return runConfirmedSafeSet({
         command: "update-product",
         tool: "set_product",
-        request: { productId: id, mode: "patch", values: { name, sku, description, cost } },
+        request: { productId: id, mode: "patch", values: { name, sku, description } },
         apply: apply === true,
         confirmPreviewHash,
         tags: [`product:${id}`],
@@ -3442,7 +3533,7 @@ export const commands = {
         chunk: number;
         chunkSize: number;
       };
-      const scan = await fetchAllVins(client, { maxProducts, inStockOnly });
+      const scan = await fetchAllSerials(client, { maxProducts, inStockOnly });
       const chunkCount = Math.max(
         1,
         Math.ceil(scan.serials.length / chunkSize)
@@ -3483,7 +3574,7 @@ export const commands = {
     { sideEffect: "read" }
   ),
 
-  "export-all-vins": createCommand(
+  "export-all-serials": createCommand(
     z.object({
       maxProducts: cliTypes.int(1, 500).optional().describe("Max products to scan (default: 100; provider max: 500)"),
       inStockOnly: cliTypes.bool().optional().describe("Only export in-stock serials"),
@@ -3510,10 +3601,10 @@ export const commands = {
         );
       }
 
-      const scan = await fetchAllVins(client, { maxProducts, inStockOnly });
+      const scan = await fetchAllSerials(client, { maxProducts, inStockOnly });
       const completeOutput = buildSafeOutput(
         {
-          command: "export-all-vins",
+          command: "export-all-serials",
           totalSerials: scan.totalSerials,
           returnedSerials: scan.totalSerials,
           productsFetched: scan.productsFetched,
@@ -3530,7 +3621,7 @@ export const commands = {
 
       return buildSafeOutput(
         {
-          command: "export-all-vins",
+          command: "export-all-serials",
           outputFile: outputPath,
           exportedSerials: scan.totalSerials,
           productsFetched: scan.productsFetched,
@@ -3624,10 +3715,13 @@ export const commands = {
   ),
 
   "list-customers": createCommand(
-    z.object({ limit: cliTypes.int(1, 250).optional().describe("Max records") }),
+    z.object({
+      limit: cliTypes.int(1, 250).optional().describe("Max records (above 100 is fetched as 100-record provider pages)"),
+      skip: cliTypes.int(0).optional().describe("Records to skip"),
+    }),
     async (args, client: InFlowMCPClient) => {
-      const { limit } = args as { limit?: number };
-      const raw = await client.listCustomers({ limit });
+      const { limit, skip } = args as { limit?: number; skip?: number };
+      const raw = await client.listCustomers({ limit, skip });
 
       const rawCustomers = (raw?.data ?? raw ?? []) as unknown[];
       const wrappedCustomers = (Array.isArray(rawCustomers) ? rawCustomers : [rawCustomers]).map(
@@ -3662,10 +3756,13 @@ export const commands = {
   ),
 
   "list-vendors": createCommand(
-    z.object({ limit: cliTypes.int(1, 250).optional().describe("Max records") }),
+    z.object({
+      limit: cliTypes.int(1, 250).optional().describe("Max records (above 100 is fetched as 100-record provider pages)"),
+      skip: cliTypes.int(0).optional().describe("Records to skip"),
+    }),
     async (args, client: InFlowMCPClient) => {
-      const { limit } = args as { limit?: number };
-      const raw = await client.listVendors({ limit });
+      const { limit, skip } = args as { limit?: number; skip?: number };
+      const raw = await client.listVendors({ limit, skip });
 
       const rawVendors = (raw?.data ?? raw ?? []) as unknown[];
       const wrappedVendors = (Array.isArray(rawVendors) ? rawVendors : [rawVendors]).map(
@@ -3715,6 +3812,11 @@ export const commands = {
   ),
 
   ...cacheCommands<InFlowMCPClient>(),
+};
+
+export const commands = {
+  ...commandDefinitions,
+  /*  */
 };
 
 let isCliEntry = false;
